@@ -215,12 +215,17 @@ fn maybe_notify(app: &crate::App, t: &Track) {
     }
     let artists = t.artists.join(", ");
     let mut n = notify_rust::Notification::new();
-    n.appname("Tarn")
+    n.appname(crate::win::APP_NAME)
         .summary(&t.title)
         .body(&artists)
         .timeout(notify_rust::Timeout::Milliseconds(4000));
+    #[cfg(windows)]
+    {
+        n.app_id(crate::win::APP_USER_MODEL_ID);
+    }
     if let Some(icon) = crate::notify_icon() {
         n.icon(&icon);
+        n.image_path(&icon);
     }
     if let Err(e) = n.show() {
         eprintln!("notify: {e}");

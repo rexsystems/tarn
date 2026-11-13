@@ -66,6 +66,11 @@ impl GrowingBody {
         self.content_len.store(n, Ordering::Relaxed);
     }
 
+    pub fn content_len(&self) -> Option<u64> {
+        let n = self.content_len.load(Ordering::Relaxed);
+        if n == 0 { None } else { Some(n) }
+    }
+
     pub fn finish(&self) {
         self.done.store(true, Ordering::SeqCst);
         self.more.notify_all();

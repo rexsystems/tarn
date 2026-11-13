@@ -225,6 +225,14 @@ impl AudioCache {
         }
     }
 
+    /// Drop both the complete file and any partial for this track.
+    pub fn forget(&self, id: &str) {
+        let _ = fs::remove_file(self.final_path(id));
+        let _ = fs::remove_file(self.part_path(id));
+        self.index.lock().unwrap().items.remove(id);
+        let _ = self.persist();
+    }
+
     pub fn clear(&self) {
         if let Ok(rd) = fs::read_dir(&self.dir) {
             for e in rd.flatten() {

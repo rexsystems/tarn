@@ -1,8 +1,20 @@
+function isYt3(url: string): boolean {
+  return url.includes('yt3.ggpht.com') || url.includes('yt3.googleusercontent.com');
+}
+
 /** Rewrite YTM/Google CDN URLs to a requested pixel size (logical * DPR). */
 export function sizedCover(url: string | null | undefined, w: number, h?: number): string {
   if (!url) return '';
   const width = Math.round(w);
   const height = Math.round(h ?? w);
+  // Channel avatars on yt3 only accept =sN-c-k-…; the album-art
+  // =wN-hN-l90-rj suffix 404s and shows as a broken image.
+  if (isYt3(url)) {
+    const i = url.lastIndexOf('=');
+    const base = i >= 0 ? url.slice(0, i) : url;
+    const s = Math.max(width, height);
+    return `${base}=s${s}-c-k-c0x00ffffff-no-rj`;
+  }
   if (url.includes('googleusercontent.com') || url.includes('ggpht.com')) {
     const i = url.lastIndexOf('=');
     if (i >= 0) return `${url.slice(0, i)}=w${width}-h${height}-l90-rj`;

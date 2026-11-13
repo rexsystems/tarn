@@ -27,20 +27,41 @@
   let srcset = $derived(
     src ? (banner ? bannerSrcset(src, w, h) : srcsetFor(src, w, w === h)) : '',
   );
+
+  let broken = $state(false);
+  let useOrig = $state(false);
+
+  $effect(() => {
+    void src;
+    broken = false;
+    useOrig = false;
+  });
+
+  let shown = $derived(useOrig && src ? src : srcUrl);
+  let shownSet = $derived(useOrig ? '' : srcset);
+
+  function onErr() {
+    if (!useOrig && src && shown !== src) {
+      useOrig = true;
+      return;
+    }
+    broken = true;
+  }
 </script>
 
-{#if srcUrl}
+{#if shown && !broken}
   <img
     class={cls}
     class:round
     {alt}
     width={w}
     height={h}
-    src={srcUrl}
-    srcset={srcset}
+    src={shown}
+    srcset={shownSet}
     sizes="{w}px"
     draggable="false"
+    onerror={onErr}
   />
 {:else}
-  <div class="ph {cls}" class:round style="width:{w}px;height:{h}px"></div>
+  <div class="ph {cls}" class:round style="width:{w}px;height:{h}px" aria-hidden="true"></div>
 {/if}

@@ -8,6 +8,7 @@ mod mix;
 mod mpris;
 mod models;
 mod persist;
+mod win;
 pub mod player;
 pub mod ytdlp;
 pub mod ytm;
@@ -97,6 +98,20 @@ pub fn notify_icon() -> Option<String> {
         if std::path::Path::new(p).exists() {
             return Some(p.into());
         }
+    }
+    // Fall back to a copy of the bundled icon in the data dir so Windows
+    // toasts and unpackaged runs have a file path to point at.
+    let dir = dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("tarn");
+    let dest = dir.join("notify.png");
+    if !dest.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&dest, include_bytes!("../icons/icon.png"));
+    }
+    if dest.is_file() {
+        return Some(dest.to_string_lossy().into());
     }
     None
 }
@@ -476,6 +491,10 @@ fn friendly_err(s: &str, fallback: &str) -> String {
         return "Sign in to continue".into();
     }
     if low.contains("403") || low.contains("forbidden") {
+        // googlevideo 403s are expired/throttled URLs, not a permission error.
+        if low.contains("audio") || low.contains("download") || low.contains("stream") {
+            return "Can't play this track".into();
+        }
         return "You don't have access to this.".into();
     }
     if low.contains("404") || low.contains("not found") {
@@ -927,6 +946,7 @@ fn emit_loop(handle: AppHandle, app: Arc<App>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    crate::win::init();
     // WebKitGTK compositing often blurs glyphs at fractional DPI.
     if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");

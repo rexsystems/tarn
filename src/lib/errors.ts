@@ -13,7 +13,10 @@ export function friendlyError(
   const low = s.toLowerCase();
   if (!s) return fallback;
   if (isAuthError(e)) return 'Sign in to continue';
-  if (/403|forbidden/.test(low)) return "You don't have access to this.";
+  if (/403|forbidden/.test(low)) {
+    if (/audio|download|stream|googlevideo/.test(low)) return "Can't play this track";
+    return "You don't have access to this.";
+  }
   if (/404|not found/.test(low)) return "We couldn't find that.";
   if (/network|failed to fetch|fetch failed|connection|timed out|timeout|dns|offline/.test(low)) {
     return "Can't reach YouTube right now.";

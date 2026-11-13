@@ -929,15 +929,17 @@ impl Ytm {
 
     /// Resolve a playable audio stream URL.
     ///
-    /// rustypipe (iOS/TV clients, no PO token) is tried first so play can
-    /// start in-process without spawning yt-dlp. The sidecar is only used
-    /// if rustypipe fails, and never on Android/iOS. Resolved URLs are
-    /// cached for a few hours (YouTube's googlevideo links last ~6 h).
+    /// rustypipe clients (iOS, then TV, then Android) are tried first so
+    /// play can start in-process without spawning yt-dlp. Each URL is
+    /// requested with the user-agent of the client that produced it —
+    /// googlevideo 403s a mismatched UA, and those URLs are also bound to
+    /// the requester's IP and an expiry. The sidecar is the last resort
+    /// (never on Android/iOS). Fresh URLs are cached until they expire.
     pub async fn stream(&self, video_id: &str) -> Result<Stream> {
         if let Some(s) = self.cached_stream(video_id) {
             return Ok(s);
         }
-        let s = self.resolve_stream(video_id).await?;
+        let s = self.resolve_stream_excluding(video_id, &[]).await?;
         self.put_stream(video_id, s.clone());
         Ok(s)
     }
@@ -945,7 +947,7 @@ impl Ytm {
     fn cached_stream(&self, id: &str) -> Option<Stream> {
         let mut g = self.streams.lock().unwrap();
         if let Some(c) = g.get(id) {
-            if c.at.elapsed() < STREAM_TTL {
+            if stream_is_fresh(&c.stream, c.at) {
                 return Some(c.stream.clone());
             }
         }
@@ -967,30 +969,49 @@ impl Ytm {
         self.streams.lock().unwrap().remove(id);
     }
 
+    /// Drop in-memory URL and in-flight body caches (tests / cold play).
+    pub fn drop_url_cache(&self) {
+        self.streams.lock().unwrap().clear();
+        self.bodies.lock().unwrap().clear();
+    }
+
+    /// Empty the on-disk audio cache and any in-memory stream URLs.
+    pub fn clear_play_cache(&self) {
+        self.drop_url_cache();
+        self.cache.clear();
+    }
+
     async fn resolve_stream(&self, video_id: &str) -> Result<Stream> {
-        match rustypipe_stream(&self.rp, video_id).await {
+        self.resolve_stream_excluding(video_id, &[]).await
+    }
+
+    async fn resolve_stream_excluding(&self, video_id: &str, skip: &[&str]) -> Result<Stream> {
+        match rustypipe_stream(&self.rp, video_id, skip).await {
             Ok(s) => return Ok(s),
             Err(e) => eprintln!("rustypipe stream: {e}"),
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            let cookies = if self.cookies_file.exists() {
-                Some(self.cookies_file.clone())
-            } else {
-                None
-            };
-            let q = self.quality();
-            return ytdlp_stream(video_id, cookies.as_deref(), &q).await;
+            if !skip.contains(&"yt-dlp") {
+                let cookies = if self.cookies_file.exists() {
+                    Some(self.cookies_file.clone())
+                } else {
+                    None
+                };
+                let q = self.quality();
+                return ytdlp_stream(video_id, cookies.as_deref(), &q).await;
+            }
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            Err(anyhow!("no playable stream"))
-        }
+        Err(anyhow!("no playable stream"))
     }
 
     /// Start a progressive download and return once enough of the file is
     /// present to probe and begin decoding (see `READY_BYTES`). The rest
     /// continues in the background.
+    ///
+    /// On 403/410 (expired or IP-bound URL, or a client/UA mismatch) the
+    /// cached URL is dropped and the next client — then the yt-dlp sidecar
+    /// — is tried, without surfacing the failure unless every path fails.
     pub async fn start_audio(
         &self,
         video_id: &str,
@@ -998,34 +1019,83 @@ impl Ytm {
     ) -> Result<std::sync::Arc<crate::decode::GrowingBody>> {
         if !video_id.is_empty() {
             if let Some(bytes) = self.cache.read_complete(video_id) {
-                let body = crate::decode::GrowingBody::from_complete(bytes);
-                self.bodies
-                    .lock()
-                    .unwrap()
-                    .insert(stream.url.clone(), body.clone());
-                return Ok(body);
+                if looks_like_audio(&bytes) {
+                    let body = crate::decode::GrowingBody::from_complete(bytes);
+                    self.bodies
+                        .lock()
+                        .unwrap()
+                        .insert(stream.url.clone(), body.clone());
+                    return Ok(body);
+                }
+                self.cache.forget(video_id);
             }
         }
+
+        let mut stream = stream.clone();
+        if !stream_is_fresh(&stream, Instant::now()) {
+            self.evict_stream(video_id);
+            stream = self.resolve_stream(video_id).await?;
+            self.put_stream(video_id, stream.clone());
+        }
+
+        let mut skipped: Vec<&str> = Vec::new();
+        if !stream.client.is_empty() {
+            skipped.push(stream.client);
+        }
+        loop {
+            match self.try_start(&stream, video_id).await {
+                Ok(body) => return Ok(body),
+                Err(e) => {
+                    if !is_freshness_error(&e) {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "audio {}: {e} ({}); trying the next client",
+                        video_id,
+                        stream.label()
+                    );
+                    self.forget_attempt(video_id, &stream);
+                    match self.resolve_stream_excluding(video_id, &skipped).await {
+                        Ok(next) => {
+                            if !next.client.is_empty() && !skipped.contains(&next.client) {
+                                skipped.push(next.client);
+                            } else if next.client == "yt-dlp" && !skipped.contains(&"yt-dlp") {
+                                skipped.push("yt-dlp");
+                            } else {
+                                return Err(e);
+                            }
+                            self.put_stream(video_id, next.clone());
+                            stream = next;
+                        }
+                        Err(e2) => {
+                            eprintln!("audio {video_id}: no more clients: {e2}");
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn try_start(
+        &self,
+        stream: &Stream,
+        video_id: &str,
+    ) -> Result<std::sync::Arc<crate::decode::GrowingBody>> {
         if let Some(existing) = self.existing_body(&stream.url) {
             existing.wait_ready().await?;
             return Ok(existing);
         }
         let body = self.spawn_download(video_id, stream);
-        match body.wait_ready().await {
-            Ok(()) => Ok(body),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("403") {
-                    self.evict_stream(video_id);
-                    self.bodies.lock().unwrap().remove(&stream.url);
-                    let stream = self.resolve_stream(video_id).await?;
-                    self.put_stream(video_id, stream.clone());
-                    let body = self.spawn_download(video_id, &stream);
-                    body.wait_ready().await?;
-                    return Ok(body);
-                }
-                Err(e)
-            }
+        body.wait_ready().await?;
+        Ok(body)
+    }
+
+    fn forget_attempt(&self, video_id: &str, stream: &Stream) {
+        self.evict_stream(video_id);
+        self.bodies.lock().unwrap().remove(&stream.url);
+        if !video_id.is_empty() {
+            self.cache.forget(video_id);
         }
     }
 
@@ -1049,11 +1119,15 @@ impl Ytm {
             return existing;
         }
         let body = crate::decode::GrowingBody::new();
-        // Resume from a partial on-disk download if we have one.
+        // Only resume a partial if we're still on the same URL family —
+        // a 403 fallback is a new file and cannot be ranged from the old
+        // prefix. `forget_attempt` already deleted the part in that case.
         if !video_id.is_empty() {
             if let Some((path, _)) = self.cache.partial(video_id) {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    body.append(&bytes);
+                    if looks_like_audio(&bytes) || bytes.len() > 4096 {
+                        body.append(&bytes);
+                    }
                 }
             }
         }
@@ -1096,15 +1170,11 @@ impl Ytm {
         if self.cache.has_complete(video_id) {
             return;
         }
-        let Ok(stream) = self.stream(video_id).await else {
-            return;
-        };
-        if let Some(existing) = self.existing_body(&stream.url) {
-            let _ = existing.wait_done().await;
-            return;
+        if let Ok(stream) = self.stream(video_id).await {
+            if let Ok(body) = self.start_audio(video_id, &stream).await {
+                let _ = body.wait_done().await;
+            }
         }
-        let body = self.spawn_download(video_id, &stream);
-        let _ = body.wait_done().await;
     }
 
     /// Wait for a complete download (diagnostics).
@@ -1122,6 +1192,85 @@ pub struct Stream {
     pub duration: Option<f64>,
     pub source: &'static str,
     pub mime: Option<String>,
+    /// Client that produced the URL: "ios", "tv", "android", "yt-dlp".
+    pub client: &'static str,
+    /// Unix timestamp from the `expire=` query param, if present.
+    pub expire: Option<u64>,
+}
+
+impl Stream {
+    pub fn label(&self) -> String {
+        if self.client.is_empty() {
+            self.source.to_string()
+        } else {
+            format!("{}-{}", self.source, self.client)
+        }
+    }
+}
+
+fn stream_is_fresh(stream: &Stream, at: Instant) -> bool {
+    let expire = stream.expire.or_else(|| url_expire(&stream.url));
+    if let Some(exp) = expire {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        return now + 90 < exp;
+    }
+    at.elapsed() < STREAM_TTL
+}
+
+fn url_query_u64(url: &str, key: &str) -> Option<u64> {
+    let q = url.split_once('?').map(|(_, q)| q).unwrap_or(url);
+    let prefix = format!("{key}=");
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix(&prefix) {
+            return v.parse().ok();
+        }
+    }
+    None
+}
+
+fn url_expire(url: &str) -> Option<u64> {
+    let q = url.split_once('?').map(|(_, q)| q).unwrap_or(url);
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("expire=") {
+            return v.parse().ok();
+        }
+    }
+    // Path-style: /expire/1234567890/
+    if let Some(i) = url.find("/expire/") {
+        let rest = &url[i + 8..];
+        let val = rest.split(&['/', '?', '&'][..]).next()?;
+        return val.parse().ok();
+    }
+    None
+}
+
+fn is_freshness_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_ascii_lowercase();
+    s.contains("403")
+        || s.contains("401")
+        || s.contains("410")
+        || s.contains("expired")
+        || s.contains("forbidden")
+}
+
+fn looks_like_audio(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
+        return true;
+    }
+    matches!(
+        bytes,
+        [b'I', b'D', b'3', ..] | [b'O', b'g', b'S', ..] | [b'R', b'I', b'F', b'F', ..]
+    ) || (bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0)
+}
+
+fn is_freshness_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 410)
 }
 
 fn cache_dir() -> PathBuf {
@@ -1303,8 +1452,11 @@ fn best_thumb(thumbs: &[Thumbnail]) -> Option<String> {
 
 fn best_thumb_wide(thumbs: &[Thumbnail]) -> Option<String> {
     let t = thumbs.iter().max_by_key(|t| t.width)?;
-    // banners look better a bit wider
     let u = &t.url;
+    // Channel avatars (yt3) only accept =sN-…, not the album-art w/h suffix.
+    if is_yt3(u) {
+        return Some(resize_yt3(u, 1280));
+    }
     if u.contains("googleusercontent.com") || u.contains("ggpht.com") {
         if let Some(i) = u.rfind('=') {
             return Some(format!("{}=w1280-h400-p-l90-rj", &u[..i]));
@@ -1313,17 +1465,28 @@ fn best_thumb_wide(thumbs: &[Thumbnail]) -> Option<String> {
     Some(upgrade_cover(u))
 }
 
+fn is_yt3(url: &str) -> bool {
+    url.contains("yt3.ggpht.com") || url.contains("yt3.googleusercontent.com")
+}
+
+fn resize_yt3(url: &str, size: u32) -> String {
+    let base = url.rfind('=').map(|i| &url[..i]).unwrap_or(url);
+    format!("{base}=s{size}-c-k-c0x00ffffff-no-rj")
+}
+
 pub fn upgrade_cover(url: &str) -> String {
-    let u = url.to_string();
-    if u.contains("googleusercontent.com") || u.contains("ggpht.com") {
-        if let Some(i) = u.rfind('=') {
-            return format!("{}=w512-h512-l90-rj", &u[..i]);
+    if is_yt3(url) {
+        return resize_yt3(url, 512);
+    }
+    if url.contains("googleusercontent.com") || url.contains("ggpht.com") {
+        if let Some(i) = url.rfind('=') {
+            return format!("{}=w512-h512-l90-rj", &url[..i]);
         }
     }
-    if u.contains("i.ytimg.com") && u.contains("/default.jpg") {
-        return u.replace("/default.jpg", "/hqdefault.jpg");
+    if url.contains("i.ytimg.com") && url.contains("/default.jpg") {
+        return url.replace("/default.jpg", "/hqdefault.jpg");
     }
-    u
+    url.to_string()
 }
 
 fn normalize_duration(d: u32) -> u32 {
@@ -1362,83 +1525,150 @@ async fn download_into(
     body: &crate::decode::GrowingBody,
     cache: Option<(std::sync::Arc<crate::cache::AudioCache>, String)>,
 ) -> Result<()> {
-    let mut last_err = None;
-    for attempt in 0..6u32 {
+    // googlevideo 403s an open-ended `Range: bytes=N-` (and a request with
+    // no Range at all) on iOS/TV URLs. Closed ranges work. Download in
+    // chunks; the first chunk is sized so we hit READY_BYTES in one round.
+    const CHUNK: u64 = 256 * 1024;
+    if let Some(n) = url_query_u64(&stream.url, "clen") {
+        body.set_content_len(n);
+    }
+    let ua = stream_ua(stream);
+    let client = reqwest::Client::builder()
+        .user_agent(&ua)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    let mut stale_tries = 0u32;
+    let mut net_tries = 0u32;
+    loop {
         let offset = body.len() as u64;
-        if let Some((cache, id)) = &cache {
-            let _ = cache.write_part(id, &body.snapshot());
+        if let Some(total) = body.content_len() {
+            if offset >= total {
+                break;
+            }
         }
-        match download_range(stream, body, offset, cache.as_ref()).await {
+        let end = match body.content_len() {
+            Some(total) => (offset + CHUNK - 1).min(total.saturating_sub(1)),
+            None => offset + CHUNK - 1,
+        };
+        if end < offset {
+            break;
+        }
+        match download_chunk(&client, stream, &ua, body, offset, end, cache.as_ref()).await {
             Ok(()) => {
+                stale_tries = 0;
+                net_tries = 0;
                 if let Some((cache, id)) = &cache {
-                    if let Err(e) = cache.commit(id, &body.snapshot()) {
-                        eprintln!("cache commit: {e}");
-                    }
+                    let _ = cache.write_part(id, &body.snapshot());
                 }
-                return Ok(());
+                // If the server gave us no total and returned a short
+                // chunk, we may be done — handled inside download_chunk
+                // via 416 or a short body with no content-len.
+                if body.content_len().is_none() {
+                    // Got a full (non-partial) response: that's the file.
+                    // download_chunk sets content_len from Content-Range
+                    // when present. If still none, one more loop will
+                    // 416 or 403; treat a short read as EOF below.
+                }
+            }
+            Err(e) if is_eof_error(&e) => break,
+            Err(e) if is_freshness_error(&e) => {
+                stale_tries += 1;
+                if stale_tries > 4 {
+                    return Err(e);
+                }
+                eprintln!(
+                    "audio chunk {}-{}: {e}; retrying ({stale_tries})",
+                    offset, end
+                );
+                tokio::time::sleep(Duration::from_millis(250 * stale_tries as u64)).await;
             }
             Err(e) => {
-                last_err = Some(e);
-                let wait = Duration::from_millis(400 * (1u64 << attempt.min(4)));
+                net_tries += 1;
+                if net_tries > 4 {
+                    return Err(e);
+                }
+                let wait = Duration::from_millis(400 * (1u64 << (net_tries - 1).min(4)));
                 eprintln!(
-                    "audio download retry {}: {}; backing off {wait:?}",
-                    attempt + 1,
-                    last_err.as_ref().unwrap()
+                    "audio download retry {net_tries}: {e}; backing off {wait:?}"
                 );
                 tokio::time::sleep(wait).await;
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("audio download failed")))
+    if body.len() < 64 {
+        return Err(anyhow!("audio download too small ({} bytes)", body.len()));
+    }
+    if let Some((cache, id)) = &cache {
+        if let Err(e) = cache.commit(id, &body.snapshot()) {
+            eprintln!("cache commit: {e}");
+        }
+    }
+    eprintln!(
+        "audio: {} bytes from {} ({})",
+        body.len(),
+        stream.label(),
+        stream.mime.as_deref().unwrap_or("?")
+    );
+    Ok(())
 }
 
-async fn download_range(
+fn is_eof_error(e: &anyhow::Error) -> bool {
+    e.to_string().contains("416") || e.to_string().contains("audio eof")
+}
+
+async fn download_chunk(
+    client: &reqwest::Client,
     stream: &Stream,
+    ua: &str,
     body: &crate::decode::GrowingBody,
     offset: u64,
+    end: u64,
     cache: Option<&(std::sync::Arc<crate::cache::AudioCache>, String)>,
 ) -> Result<()> {
-    // googlevideo stalls on HTTP/2 and throttles without a Range request.
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent())
-        .http1_only()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
-        .build()?;
     let mut req = client.get(&stream.url);
     for (k, v) in &stream.headers {
-        if k.eq_ignore_ascii_case("range") {
+        if k.eq_ignore_ascii_case("range") || k.eq_ignore_ascii_case("user-agent") {
             continue;
         }
         req = req.header(k.as_str(), v.as_str());
     }
-    req = req.header("Range", format!("bytes={offset}-"));
+    req = req.header("User-Agent", ua);
+    // Closed range only — `bytes=N-` 403s on iOS/TV googlevideo URLs.
+    req = req.header("Range", format!("bytes={offset}-{end}"));
     let resp = req.send().await.context("audio download")?;
     let status = resp.status();
     if status.as_u16() == 416 {
-        // Already have the whole file.
         if body.len() >= 64 {
-            return Ok(());
+            return Err(anyhow!("audio eof"));
         }
         return Err(anyhow!("audio download: HTTP 416"));
+    }
+    if is_freshness_status(status) {
+        return Err(anyhow!("audio download: HTTP {status}"));
     }
     if !status.is_success() {
         return Err(anyhow!("audio download: HTTP {status}"));
     }
     if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
         if let Ok(s) = cr.to_str() {
+            // "bytes 0-1023/2975815"
             if let Some(total) = s.rsplit('/').next() {
                 if let Ok(n) = total.parse::<u64>() {
                     body.set_content_len(n);
                 }
             }
         }
-    } else if let Some(len) = resp.content_length() {
-        body.set_content_len(len.saturating_add(offset));
+    } else if status.as_u16() == 200 {
+        if let Some(len) = resp.content_length() {
+            body.set_content_len(len.saturating_add(offset));
+        }
     }
-    let mut resp = resp;
     let mut n = 0usize;
+    let mut resp = resp;
     while let Some(chunk) = resp.chunk().await.context("audio body")? {
         n += chunk.len();
         body.append(&chunk);
@@ -1446,39 +1676,140 @@ async fn download_range(
             let _ = cache.append_part(id, &chunk);
         }
     }
-    if body.len() < 64 {
-        return Err(anyhow!("audio download too small ({} bytes)", body.len()));
+    if n == 0 && body.content_len().is_some_and(|t| body.len() as u64 >= t) {
+        return Err(anyhow!("audio eof"));
     }
-    eprintln!(
-        "audio: +{n} bytes (total {}) from {} ({})",
-        body.len(),
-        stream.source,
-        stream.mime.as_deref().unwrap_or("?")
-    );
+    if n == 0 {
+        return Err(anyhow!("audio download: empty chunk at {offset}"));
+    }
     Ok(())
 }
 
-async fn rustypipe_stream(rp: &RustyPipe, id: &str) -> Result<Stream> {
-    // iOS and TV clients return unobfuscated URLs and do not need a PO token.
-    let player = rp
-        .query()
-        .player_from_clients(id, &[ClientType::Ios, ClientType::Tv])
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    let stream = pick_audio(&player.audio_streams).ok_or_else(|| {
-        anyhow!(
-            "no audio streams (client={:?}, videos={})",
-            player.client_type,
-            player.video_streams.len()
-        )
-    })?;
-    Ok(Stream {
-        url: stream.url.clone(),
-        headers: vec![("User-Agent".into(), user_agent())],
-        duration: stream.duration_ms.map(|ms| ms as f64 / 1000.0),
-        source: "rustypipe",
-        mime: Some(stream.mime.clone()),
-    })
+/// Confirm a googlevideo URL answers with the given client headers.
+/// Used so a 403 is caught before we cache the URL or start decoding.
+async fn probe_stream(stream: &Stream) -> Result<()> {
+    let ua = stream_ua(stream);
+    let client = reqwest::Client::builder()
+        .user_agent(&ua)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(12))
+        .build()?;
+    let mut req = client.get(&stream.url);
+    for (k, v) in &stream.headers {
+        if k.eq_ignore_ascii_case("range") || k.eq_ignore_ascii_case("user-agent") {
+            continue;
+        }
+        req = req.header(k.as_str(), v.as_str());
+    }
+    req = req.header("User-Agent", &ua);
+    req = req.header("Range", "bytes=0-1023");
+    let resp = req.send().await.context("audio probe")?;
+    let status = resp.status();
+    // Drain a little so the connection is clean, then drop.
+    let _ = resp.bytes().await;
+    if is_freshness_status(status) {
+        return Err(anyhow!("audio download: HTTP {status}"));
+    }
+    if status.as_u16() == 416 {
+        return Ok(());
+    }
+    if !status.is_success() {
+        return Err(anyhow!("audio probe: HTTP {status}"));
+    }
+    Ok(())
+}
+
+fn stream_ua(stream: &Stream) -> String {
+    stream
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(user_agent)
+}
+
+fn client_name(ctype: ClientType) -> &'static str {
+    match ctype {
+        ClientType::Ios => "ios",
+        ClientType::Tv => "tv",
+        ClientType::Android => "android",
+        ClientType::Mobile => "mobile",
+        ClientType::DesktopMusic => "web-music",
+        ClientType::Desktop => "web",
+        _ => "other",
+    }
+}
+
+fn headers_for(rp: &RustyPipe, ctype: ClientType) -> Vec<(String, String)> {
+    let ua = rp.query().user_agent(ctype).into_owned();
+    let mut h = vec![
+        ("User-Agent".into(), ua),
+        ("Accept".into(), "*/*".into()),
+        ("Accept-Language".into(), "en-US,en;q=0.9".into()),
+    ];
+    match ctype {
+        ClientType::Tv => {
+            h.push(("Origin".into(), "https://www.youtube.com".into()));
+            h.push(("Referer".into(), "https://www.youtube.com/tv".into()));
+        }
+        ClientType::Desktop | ClientType::DesktopMusic => {
+            h.push(("Origin".into(), "https://www.youtube.com".into()));
+            h.push(("Referer".into(), "https://www.youtube.com/".into()));
+        }
+        // Native app clients: UA only. A web Origin on an iOS URL 403s.
+        _ => {}
+    }
+    h
+}
+
+async fn rustypipe_stream(rp: &RustyPipe, id: &str, skip: &[&str]) -> Result<Stream> {
+    // iOS and TV return unobfuscated URLs and do not need a PO token.
+    // Android is a useful extra fallback. Each is requested separately so a
+    // URL that 403s under its own UA can be skipped without giving up.
+    let order = [ClientType::Ios, ClientType::Tv, ClientType::Android];
+    let mut last = None;
+    for ctype in order {
+        let name = client_name(ctype);
+        if skip.contains(&name) {
+            continue;
+        }
+        match rp.query().player_from_clients(id, &[ctype]).await {
+            Ok(player) => {
+                let used = player.client_type;
+                let used_name = client_name(used);
+                let Some(audio) = pick_audio(&player.audio_streams) else {
+                    last = Some(anyhow!("no audio streams (client={used_name})"));
+                    continue;
+                };
+                let stream = Stream {
+                    url: audio.url.clone(),
+                    headers: headers_for(rp, used),
+                    duration: audio.duration_ms.map(|ms| ms as f64 / 1000.0),
+                    source: "rustypipe",
+                    mime: Some(audio.mime.clone()),
+                    client: used_name,
+                    expire: url_expire(&audio.url),
+                };
+                match probe_stream(&stream).await {
+                    Ok(()) => {
+                        eprintln!("stream: rustypipe {used_name} ({})", audio.mime);
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        eprintln!("stream probe {used_name}: {e}");
+                        last = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("rustypipe {name}: {e}");
+                last = Some(anyhow!("{e}"));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("no rustypipe stream")))
 }
 
 fn pick_audio(streams: &[rustypipe::model::AudioStream]) -> Option<&rustypipe::model::AudioStream> {
@@ -1498,7 +1829,20 @@ fn pick_audio(streams: &[rustypipe::model::AudioStream]) -> Option<&rustypipe::m
 }
 
 pub fn user_agent() -> String {
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36".into()
+    // Used for InnerTube / page fetches, not for googlevideo. Match the OS
+    // so a Windows build does not claim to be Linux Chrome.
+    #[cfg(windows)]
+    {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into()
+    }
 }
 
 fn format_for(quality: &str) -> &'static str {
@@ -1521,7 +1865,12 @@ async fn ytdlp_stream(
     let url = format!("https://www.youtube.com/watch?v={id}");
     let mut cmd = Command::new(&bin);
     crate::ytdlp::silence_tokio(&mut cmd);
-    cmd.arg("--no-warnings").arg("--no-playlist").arg("-f").arg(format_for(quality));
+    cmd.arg("--no-warnings")
+        .arg("--no-playlist")
+        .arg("-f")
+        .arg(format_for(quality));
+        // Let yt-dlp pick a working player client. Pinning ios/tv/android/web
+        // fails with "Requested format is not available" on current YouTube.
     if let Some(p) = cookies {
         cmd.arg("--cookies").arg(p);
     }
@@ -1559,16 +1908,22 @@ async fn ytdlp_stream(
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
     {
+        // yt-dlp almost always ships a UA that matches the extractor
+        // client. Only fall back if the JSON omitted it.
         headers.push(("User-Agent".into(), user_agent()));
     }
     let duration = v.get("duration").and_then(|d| d.as_f64());
     let mime = v.get("ext").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let expire = url_expire(&stream_url);
+    eprintln!("stream: yt-dlp ({})", mime.as_deref().unwrap_or("?"));
     Ok(Stream {
         url: stream_url,
         headers,
         duration,
         source: "yt-dlp",
         mime,
+        client: "yt-dlp",
+        expire,
     })
 }
 
