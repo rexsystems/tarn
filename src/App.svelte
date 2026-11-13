@@ -82,17 +82,35 @@
   let cacheUsed = $state(0);
   let cacheMax = $state(1024 * 1024 * 1024);
 
-  const HOME_KEY = 'tarn.home.v1';
-  function readHomeCache(): Home | null {
+  function homeCacheKey(account?: string | null): string {
+    return `tarn.home.v2.${account || 'anon'}`;
+  }
+  function clearHomeCaches() {
     try {
-      const raw = localStorage.getItem(HOME_KEY);
+      const drop: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k.startsWith('tarn.home.') || k === 'tarn.home.v1')) drop.push(k);
+      }
+      for (const k of drop) localStorage.removeItem(k);
+    } catch {}
+  }
+  function readHomeCache(account?: string | null): Home | null {
+    try {
+      const raw = localStorage.getItem(homeCacheKey(account));
       if (!raw) return null;
       const v = JSON.parse(raw);
-      return (v && v.home) ? v.home as Home : v as Home;
+      const h = (v && v.home) ? v.home as Home : v as Home;
+      // Never serve a logged-out (or other-account) feed when signed in.
+      if (account && h && h.signed_in === false) return null;
+      return h;
     } catch { return null; }
   }
-  function writeHomeCache(h: Home) {
-    try { localStorage.setItem(HOME_KEY, JSON.stringify({ at: Date.now(), home: h })); } catch {}
+  function writeHomeCache(h: Home, account?: string | null) {
+    try {
+      const key = homeCacheKey(account ?? (auth.signed_in ? (auth.account?.name ?? 'user') : 'anon'));
+      localStorage.setItem(key, JSON.stringify({ at: Date.now(), account: key, home: h }));
+    } catch {}
   }
   function dedupeTracks(list: Track[]): Track[] {
     const seen = new Set<string>();
@@ -115,7 +133,7 @@
   onMount(() => {
     const unsubs: Array<() => void> = [];
     (async () => {
-      home = readHomeCache();
+      /* home cache is account-keyed; filled after auth() below */
       likes = localLikes();
       recents = localRecents();
       try {
@@ -125,6 +143,12 @@
         }));
         auth = await api.auth();
         settings = await api.settings();
+        const acct = auth.signed_in ? (auth.account?.name ?? 'user') : 'anon';
+        if (auth.signed_in) {
+          // Drop any leftover logged-out snapshot so we never flash it.
+          try { localStorage.removeItem(homeCacheKey('anon')); } catch {}
+        }
+        home = readHomeCache(acct);
       } catch {}
       if (!auth.signed_in && player.track && isLocalLiked(player.track.id)) {
         player.liked = true;
@@ -161,13 +185,22 @@
     }).then((u) => unsubs.push(u));
     listen('auth', () => {
       api.auth().then((a) => {
+        const was = auth.signed_in;
         auth = a;
+        if (a.signed_in !== was) {
+          clearHomeCaches();
+          home = null;
+          explore = null;
+        }
         if (a.signed_in) {
           loadLibrary();
           loadHome();
+          if (view.id === 'explore') loadExplore();
           for (const t of localLikes()) {
             api.like(t.id, 'like').catch(() => {});
           }
+        } else if (was) {
+          loadHome();
         }
       });
     }).then((u) => unsubs.push(u));
@@ -338,13 +371,22 @@
     return true;
   }
 
+  async function copyDiagnostics() {
+    try {
+      const text = await api.diagnostics();
+      await navigator.clipboard.writeText(text);
+      toast('Diagnostics copied', 'info', 2500);
+    } catch (e) {
+      fail(e, "Couldn't copy diagnostics");
+    }
+  }
   async function loadHome(params?: string | null) {
     const quiet = !params && !!home;
     if (!quiet) loading = true;
     try {
       const h = await api.home(params);
       home = h;
-      if (!params) writeHomeCache(h);
+      if (!params) writeHomeCache(h, auth.signed_in ? (auth.account?.name ?? 'user') : 'anon');
     } catch (e) {
       if (!home) fail(e, "Couldn't load Home");
     } finally {
@@ -1273,10 +1315,16 @@
             </span>
             <button class="upd-check" type="button" onclick={() => (updateCheck += 1)}>Check for updates</button>
           </div>
+          <div class="set-row">
+            <span class="lb">Diagnostics
+              <span class="t-meta" style="display:block;font-weight:450;margin-top:2px">Auth, library, and recent logs — no cookie values.</span>
+            </span>
+            <button class="btn ghost" type="button" onclick={copyDiagnostics}>Copy diagnostics</button>
+          </div>
           {#if auth.signed_in}
             <div class="set-row">
               <span class="lb"><Hi icon={Logout03Icon} size={20} /> {auth.account?.name || 'Account'}</span>
-              <button class="btn ghost" type="button" onclick={async () => { await api.signOut(); auth = { signed_in: false, mock: false, account: null, store: null }; library = null; }}>Sign out</button>
+              <button class="btn ghost" type="button" onclick={async () => { await api.signOut(); auth = { signed_in: false, mock: false, account: null, store: null }; library = null; clearHomeCaches(); home = null; explore = null; if (view.id === 'home') loadHome(); if (view.id === 'explore') loadExplore(); }}>Sign out</button>
             </div>
           {/if}
         </div>

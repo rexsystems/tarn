@@ -51,6 +51,7 @@ export const api = {
   auth: () => invoke<AuthStatus>('auth_status'),
   openLogin: () => invoke<void>('open_login'),
   signOut: () => invoke<void>('sign_out'),
+  diagnostics: () => invoke<string>('diagnostics'),
   settings: () => invoke<Settings>('get_settings'),
   setSettings: (settings: Settings) => invoke<void>('set_settings', { settings }),
   prefetch: (id: string) => { void invoke<void>('prefetch', { id }); },

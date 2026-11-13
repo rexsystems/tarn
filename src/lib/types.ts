@@ -154,6 +154,7 @@ export interface AccountInfo {
   name: string;
   photo: string | null;
   handle: string | null;
+  page_id?: string | null;
 }
 
 export interface Library {

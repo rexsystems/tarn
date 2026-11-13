@@ -399,7 +399,9 @@ html { color-scheme: dark; }
 /* ---------- page ---------- */
 .page {
   padding: 28px 32px 48px;
-  max-width: 1280px;
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
 }
 .page-title {
   font-size: 28px;
@@ -1221,7 +1223,19 @@ html { color-scheme: dark; }
 .np-meta .ar { font-size: 18px; line-height: 24px; color: var(--text-2); margin-top: 8px; }
 
 /* ---------- settings ---------- */
-.set { max-width: 560px; }
+.set {
+  max-width: 880px;
+  width: 100%;
+}
+@media (min-width: 1280px) {
+  .set {
+    max-width: none;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 48px;
+    align-items: start;
+  }
+}
 .set-row {
   display: flex;
   align-items: center;

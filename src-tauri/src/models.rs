@@ -58,6 +58,9 @@ pub struct Shelf {
     /// "tracks" | "albums" | "playlists" | "artists" | "moods" | "mixed" | "videos"
     pub kind: String,
     pub items: Vec<ShelfItem>,
+    /// Per-shelf InnerTube continuation ("show more" / next page of this row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -203,6 +206,9 @@ pub struct AccountInfo {
     pub name: String,
     pub photo: Option<String>,
     pub handle: Option<String>,
+    /// Brand-account Gaia / page id for X-Goog-PageId and onBehalfOfUser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

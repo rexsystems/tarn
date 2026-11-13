@@ -68,19 +68,92 @@ pub fn is_youtube_related(domain: &str) -> bool {
 }
 
 pub fn session_ready_from_cookies(cookies: &[CookieRec]) -> bool {
-    cookies.iter().any(|c| {
-        matches!(
-            c.name.as_str(),
-            "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID" | "__Secure-3PAPISID" | "__Secure-1PAPISID"
-        ) && !c.value.is_empty()
-    })
+    let has = |n: &str| cookies.iter().any(|c| c.name == n && !c.value.is_empty());
+    has("SAPISID")
+        || has("__Secure-3PAPISID")
+        || has("__Secure-1PAPISID")
+        || has("__Secure-1PSID")
+        || has("__Secure-3PSID")
+}
+
+/// A session we trust enough to close the login window: a SAPISID
+/// (for SAPISIDHASH) and a SID-family cookie.
+pub fn session_complete_from_cookies(cookies: &[CookieRec]) -> bool {
+    let has = |n: &str| cookies.iter().any(|c| c.name == n && !c.value.is_empty());
+    let sapi = has("SAPISID") || has("__Secure-3PAPISID") || has("__Secure-1PAPISID");
+    let sid = has("__Secure-1PSID") || has("__Secure-3PSID") || has("SID") || has("LOGIN_INFO");
+    sapi && sid
 }
 
 pub fn session_ready_from_header(header: &str) -> bool {
     header.contains("SAPISID=")
         || header.contains("__Secure-3PAPISID=")
+        || header.contains("__Secure-1PAPISID=")
         || header.contains("__Secure-1PSID=")
         || header.contains("__Secure-3PSID=")
+}
+
+pub fn session_complete_from_header(header: &str) -> bool {
+    let sapi = header.contains("SAPISID=")
+        || header.contains("__Secure-3PAPISID=")
+        || header.contains("__Secure-1PAPISID=");
+    let sid = header.contains("__Secure-1PSID=")
+        || header.contains("__Secure-3PSID=")
+        || header.contains("LOGIN_INFO=")
+        || header.contains("SID=");
+    sapi && sid
+}
+
+/// Cookie *names* only, from a Cookie request header.
+pub fn header_cookie_names(header: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for part in header.split(';') {
+        if let Some((k, _)) = part.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() {
+                names.push(k.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Merge a `Set-Cookie` response value into an existing Cookie header.
+/// Used so rotating SIDCC / __Secure-3PSIDCC stay fresh.
+pub fn merge_set_cookie(header: &str, set_cookie: &str) -> String {
+    let Some((nv, _)) = set_cookie.split_once(';').map(|(a, b)| (a, Some(b))).or_else(|| {
+        set_cookie.split_once('=').map(|_| (set_cookie, None))
+    }) else {
+        return header.to_string();
+    };
+    let nv = nv.trim();
+    let Some((name, _)) = nv.split_once('=') else {
+        return header.to_string();
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return header.to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for part in header.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, _)) = part.split_once('=') {
+            if k.trim() == name {
+                parts.push(nv.to_string());
+                replaced = true;
+                continue;
+            }
+        }
+        parts.push(part.to_string());
+    }
+    if !replaced {
+        parts.push(nv.to_string());
+    }
+    parts.join("; ")
 }
 
 /// Cookie request header (`Name=Value; Name2=Value2`).
@@ -151,7 +224,7 @@ pub fn sapisid_from_header(header: &str) -> Option<String> {
     None
 }
 
-fn header_value(header: &str, name: &str) -> Option<String> {
+pub fn header_value(header: &str, name: &str) -> Option<String> {
     for part in header.split(';') {
         let part = part.trim();
         if let Some((k, v)) = part.split_once('=') {
@@ -162,6 +235,33 @@ fn header_value(header: &str, name: &str) -> Option<String> {
     }
     None
 }
+
+/// YouTube `PREF` cookie carries the account's `hl` / `gl` (e.g. `hl=ro&gl=RO`).
+pub fn locale_from_pref(header: &str) -> Option<(String, String)> {
+    let pref = header_value(header, "PREF")?;
+    let mut hl = None;
+    let mut gl = None;
+    for part in pref.split('&') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            match k.trim() {
+                "hl" => hl = Some(v.to_string()),
+                "gl" => gl = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    match (hl, gl) {
+        (Some(h), Some(g)) => Some((h, g)),
+        (Some(h), None) => Some((h, "US".into())),
+        _ => None,
+    }
+}
+
 
 /// `(timestamp, Authorization header value)` e.g. `SAPISIDHASH 123_abc`.
 pub fn sapisidhash(sapisid: &str, origin: &str, timestamp: u64) -> String {
@@ -200,14 +300,19 @@ impl SessionStore {
         if cookie_header.is_empty() {
             return Err(anyhow!("empty session"));
         }
+        // Always write the encrypted file so a Windows keyring glitch
+        // (or a later failed read) does not log the user out.
+        let file_ok = self.save_file(cookie_header);
         match keyring_set(cookie_header) {
             Ok(()) => {
-                // also remove any leftover file
-                let _ = fs::remove_file(self.session_path());
+                if let Err(e) = &file_ok {
+                    eprintln!("session file backup: {e}");
+                }
                 Ok(StoreKind::Keyring)
             }
-            Err(_) => {
-                self.save_file(cookie_header)?;
+            Err(e) => {
+                eprintln!("keyring save: {e}; using encrypted file");
+                file_ok?;
                 Ok(StoreKind::EncryptedFile)
             }
         }
@@ -374,6 +479,13 @@ mod tests {
     }
 
     #[test]
+    fn locale_from_pref_parses() {
+        let h = "SAPISID=x; PREF=tz=Europe.Bucharest&hl=ro&gl=RO; SID=y";
+        assert_eq!(locale_from_pref(h), Some(("ro".into(), "RO".into())));
+        assert_eq!(locale_from_pref("SAPISID=x"), None);
+    }
+
+    #[test]
     fn header_and_ready() {
         let cookies = vec![
             c("VISITOR_INFO1_LIVE", "abc", ".youtube.com"),
@@ -478,4 +590,19 @@ pub fn cookies_from_header(header: &str) -> Vec<CookieRec> {
 
 pub fn netscape_from_header(header: &str) -> String {
     to_netscape(&cookies_from_header(header))
+}
+
+static PENDING_SET_COOKIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn note_set_cookies(lines: &[String]) {
+    if let Ok(mut g) = PENDING_SET_COOKIES.lock() {
+        g.extend(lines.iter().cloned());
+    }
+}
+
+pub fn take_set_cookies() -> Vec<String> {
+    PENDING_SET_COOKIES
+        .lock()
+        .map(|mut g| g.drain(..).collect())
+        .unwrap_or_default()
 }

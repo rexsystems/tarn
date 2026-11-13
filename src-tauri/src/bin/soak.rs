@@ -82,6 +82,12 @@ async fn main() {
         }
     }
 
+    let first_sound = args.iter().any(|a| a == "--first-sound");
+    if first_sound {
+        run_first_sound(&y, tracks).await;
+        return;
+    }
+
     let rounds = if full_only { 0 } else if stress { 40 } else { 8 };
     println!("\n=== resolve + first-chunk  ({rounds} rounds, cold cache) ===");
     let mut resolve_ok = 0u32;
@@ -205,6 +211,101 @@ struct FirstInfo {
     source: String,
     ready: usize,
     clen: Option<u64>,
+}
+
+
+async fn run_first_sound(y: &Ytm, mut tracks: Vec<(String, String)>) {
+    // Top up to ~20 well-known tracks via search if the caller didn't pass ids.
+    if tracks.len() < 20 {
+        for (q, hint) in [
+            ("Smells Like Teen Spirit Nirvana", "Smells"),
+            ("Bohemian Rhapsody Queen", "Bohemian"),
+            ("Hotel California Eagles", "Hotel"),
+            ("Wonderwall Oasis", "Wonderwall"),
+            ("Creep Radiohead", "Creep"),
+            ("Around the World Daft Punk", "Around"),
+            ("One More Time Daft Punk", "One More"),
+            ("Karma Police Radiohead", "Karma"),
+            ("Losing My Religion REM", "Losing"),
+            ("Every Breath You Take Police", "Every Breath"),
+            ("Africa Toto", "Africa"),
+            ("Stayin Alive Bee Gees", "Stayin"),
+            ("September Earth Wind Fire", "September"),
+            ("Superstition Stevie Wonder", "Superstition"),
+            ("Respect Aretha", "Respect"),
+            ("Yesterday Beatles", "Yesterday"),
+        ] {
+            if tracks.len() >= 20 {
+                break;
+            }
+            match y.search_tracks(q).await {
+                Ok(ts) => {
+                    if let Some(t) = ts.into_iter().find(|t| {
+                        t.title.to_lowercase().contains(&hint.to_lowercase())
+                    }) {
+                        if !tracks.iter().any(|(id, _)| id == &t.id) {
+                            println!("search {q:?} -> {} [{}]", t.title, t.id);
+                            tracks.push((t.id, t.title));
+                        }
+                    }
+                }
+                Err(e) => println!("search {q:?}: {e}"),
+            }
+        }
+    }
+    tracks.truncate(20);
+    println!("\n=== time-to-first-sound  ({} tracks, cold cache) ===", tracks.len());
+    let mut times: Vec<(String, u128, String)> = Vec::new();
+    let mut fails = 0u32;
+    for (i, (id, title)) in tracks.iter().enumerate() {
+        y.clear_play_cache();
+        y.drop_url_cache();
+        let t0 = Instant::now();
+        match resolve_and_first(y, id).await {
+            Ok(info) => {
+                let ms = t0.elapsed().as_millis();
+                println!(
+                    "OK  [{:02}/{}] {title} ({id}) {}-{} ready={}  {} ms",
+                    i + 1,
+                    tracks.len(),
+                    info.source,
+                    info.client,
+                    info.ready,
+                    ms
+                );
+                times.push((title.clone(), ms, format!("{}-{}", info.source, info.client)));
+            }
+            Err(e) => {
+                fails += 1;
+                println!(
+                    "FAIL [{:02}/{}] {title} ({id}): {e} ({} ms)",
+                    i + 1,
+                    tracks.len(),
+                    t0.elapsed().as_millis()
+                );
+            }
+        }
+    }
+    if times.is_empty() {
+        println!("no successful first-sound measurements");
+        return;
+    }
+    let mut ms: Vec<u128> = times.iter().map(|t| t.1).collect();
+    ms.sort();
+    let pct = |p: f64| -> u128 {
+        let idx = ((p / 100.0) * (ms.len() as f64 - 1.0)).round() as usize;
+        ms[idx.min(ms.len() - 1)]
+    };
+    let mean = ms.iter().sum::<u128>() as f64 / ms.len() as f64;
+    println!(
+        "\nfirst-sound: {} ok, {fails} fail  min={} ms  p50={} ms  p90={} ms  max={} ms  mean={:.0} ms",
+        times.len(),
+        ms[0],
+        pct(50.0),
+        pct(90.0),
+        ms[ms.len() - 1],
+        mean
+    );
 }
 
 async fn resolve_and_first(y: &Ytm, id: &str) -> anyhow::Result<FirstInfo> {

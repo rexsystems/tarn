@@ -22,6 +22,7 @@ pub struct InnerTube {
     cookie: Option<String>,
     lang: String,
     region: String,
+    page_id: Option<String>,
 }
 
 impl InnerTube {
@@ -31,18 +32,28 @@ impl InnerTube {
             cookie,
             lang,
             region,
+            page_id: None,
         }
     }
 
+    pub fn with_page_id(mut self, page_id: Option<String>) -> Self {
+        self.page_id = page_id.filter(|s| !s.is_empty());
+        self
+    }
+
     fn context(&self) -> Value {
-        json!({
+        let mut ctx = json!({
             "client": {
                 "clientName": CLIENT_NAME,
                 "clientVersion": CLIENT_VERSION,
                 "hl": self.lang,
                 "gl": self.region.to_uppercase(),
             }
-        })
+        });
+        if let Some(pid) = &self.page_id {
+            ctx["user"] = json!({ "onBehalfOfUser": pid });
+        }
+        ctx
     }
 
     pub async fn post(&self, endpoint: &str, mut body: Value) -> Result<Value> {
@@ -65,12 +76,56 @@ impl InnerTube {
             if let Some(sap) = sapisid_from_header(c) {
                 req = req.header("Authorization", sapisidhash_now(&sap));
             }
+            // WEB_REMIX signed-in calls need AuthUser (default 0) and,
+            // for a brand account, X-Goog-PageId (set by the caller on context).
+            req = req.header("X-Goog-AuthUser", "0");
+            if let Some(v) = crate::auth::header_value(c, "VISITOR_INFO1_LIVE") {
+                req = req.header("X-Goog-Visitor-Id", v);
+            }
+            if let Some(pid) = &self.page_id {
+                req = req.header("X-Goog-PageId", pid);
+            }
         }
         let resp = req.json(&body).send().await?;
         let status = resp.status();
+        // Persist rotating SIDCC / PSIDCC from Set-Cookie (values not logged).
+        let set_cookies: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+            .collect();
         let text = resp.text().await.unwrap_or_default();
+        let browse = body
+            .get("browseId")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        crate::diag::log(format!(
+            "innertube {endpoint}{browse_bit}: HTTP {status} bytes={} set-cookie={}",
+            text.len(),
+            set_cookies
+                .iter()
+                .filter_map(|s| s.split('=').next())
+                .collect::<Vec<_>>()
+                .join(","),
+            browse_bit = if browse.is_empty() {
+                String::new()
+            } else {
+                format!(" {browse}")
+            },
+        ));
+        if !set_cookies.is_empty() {
+            crate::auth::note_set_cookies(&set_cookies);
+        }
         if !status.is_success() {
+            // A transient 401/403 is NOT a sign-out. Callers log and retry.
             return Err(anyhow!("innertube {endpoint}: HTTP {status}"));
+        }
+        // Detect logged-out responses that still return 200.
+        if text.contains("LOGIN_REQUIRED") || text.contains("loggedOut") {
+            crate::diag::log(format!(
+                "innertube {endpoint}: body looks logged-out (LOGIN_REQUIRED)"
+            ));
         }
         serde_json::from_str(&text).map_err(|e| anyhow!("innertube json: {e}"))
     }
@@ -91,21 +146,145 @@ impl InnerTube {
 
     pub async fn home(&self, params: Option<&str>) -> Result<Home> {
         let v = self.browse("FEmusic_home", params).await?;
+        let account_hdr = response_has_account(&v);
         let mut home = parse_home(&v);
-        // One continuation page fills "Listen again" / mixed shelves when present.
-        if let Some(tok) = home.continuation.clone() {
-            if let Ok(more) = self.browse_continuation(&tok).await {
-                let extra = parse_home(&more);
-                merge_home(&mut home, extra);
+        home.continuation = find_page_continuation(&v);
+        // Follow continuation pages so Listen again / Quick picks / Mixed
+        // for you and the rest of the personalized feed actually arrive.
+        for n in 0..8 {
+            let Some(tok) = home.continuation.clone() else {
+                break;
+            };
+            match self.browse_continuation(&tok).await {
+                Ok(more) => {
+                    let extra = parse_home(&more);
+                    crate::diag::log(format!(
+                        "home continuation {}: +{} shelves (token {} chars)",
+                        n + 1,
+                        extra.shelves.len(),
+                        tok.len()
+                    ));
+                    merge_home(&mut home, extra);
+                    home.continuation = find_page_continuation(&more);
+                }
+                Err(e) => {
+                    crate::diag::log(format!("home continuation {}: {e}", n + 1));
+                    break;
+                }
             }
         }
+        // Per-shelf "show more" tokens — fill Listen again / Quick picks / etc.
+        for s in &mut home.shelves {
+            self.expand_shelf(s).await;
+        }
         home.signed_in = self.cookie.is_some();
+        crate::diag::log(format!(
+            "home: signed_in={} account_header={} hl={} gl={} page_id={} chips={} shelves={:?}",
+            home.signed_in,
+            account_hdr,
+            self.lang,
+            self.region,
+            self.page_id.as_deref().map(|_| "set").unwrap_or("none"),
+            home.chips.len(),
+            home.shelves
+                .iter()
+                .map(|s| format!("{} ({})", s.title, s.items.len()))
+                .collect::<Vec<_>>()
+        ));
+        if self.cookie.is_some() && !account_hdr {
+            crate::diag::log(
+                "home: cookie was sent but the response has no account header — may be logged out",
+            );
+        }
         Ok(home)
     }
 
     pub async fn explore(&self) -> Result<Explore> {
         let v = self.browse("FEmusic_explore", None).await?;
-        Ok(parse_explore(&v))
+        let account_hdr = response_has_account(&v);
+        let mut ex = parse_explore(&v);
+        let mut tok = find_page_continuation(&v);
+        for n in 0..6 {
+            let Some(t) = tok.clone() else {
+                break;
+            };
+            match self.browse_continuation(&t).await {
+                Ok(more) => {
+                    let extra = parse_explore(&more);
+                    crate::diag::log(format!(
+                        "explore continuation {}: +{} shelves",
+                        n + 1,
+                        extra.shelves.len()
+                    ));
+                    for s in extra.shelves {
+                        if !ex
+                            .shelves
+                            .iter()
+                            .any(|h| h.title == s.title && h.items.len() == s.items.len())
+                        {
+                            ex.shelves.push(s);
+                        }
+                    }
+                    if ex.moods.is_empty() {
+                        ex.moods = extra.moods;
+                    }
+                    if ex.links.is_empty() {
+                        ex.links = extra.links;
+                    }
+                    tok = find_page_continuation(&more);
+                }
+                Err(e) => {
+                    crate::diag::log(format!("explore continuation {}: {e}", n + 1));
+                    break;
+                }
+            }
+        }
+        for s in &mut ex.shelves {
+            self.expand_shelf(s).await;
+        }
+        crate::diag::log(format!(
+            "explore: account_header={} shelves={:?}",
+            account_hdr,
+            ex.shelves
+                .iter()
+                .map(|s| format!("{} ({})", s.title, s.items.len()))
+                .collect::<Vec<_>>()
+        ));
+        Ok(ex)
+    }
+
+    async fn expand_shelf(&self, shelf: &mut Shelf) {
+        for n in 0..4 {
+            let Some(tok) = shelf.continuation.take() else {
+                return;
+            };
+            match self.browse_continuation(&tok).await {
+                Ok(v) => {
+                    let (items, next) = parse_continuation_items(&v);
+                    let before = shelf.items.len();
+                    for it in items {
+                        if it.id.is_empty() || !shelf.items.iter().any(|x| x.id == it.id) {
+                            shelf.items.push(it);
+                        }
+                    }
+                    crate::diag::log(format!(
+                        "shelf '{}' continuation {}: {} -> {} items",
+                        shelf.title,
+                        n + 1,
+                        before,
+                        shelf.items.len()
+                    ));
+                    shelf.continuation = next;
+                    if shelf.items.len() == before {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    crate::diag::log(format!("shelf '{}' continuation: {e}", shelf.title));
+                    break;
+                }
+            }
+        }
     }
 
     pub async fn charts(&self) -> Result<Home> {
@@ -366,6 +545,7 @@ fn parse_shelf(val: &Value) -> Option<Shelf> {
         subtitle,
         kind,
         items,
+        continuation: find_continuation(val),
     })
 }
 
@@ -639,10 +819,18 @@ fn parse_account(v: &Value) -> Option<AccountInfo> {
     let mut name = None;
     let mut photo = None;
     let mut handle = None;
+    let mut page_id = None;
     walk(v, &mut |key, val| {
         if key == "accountName" || key == "accountNameButtonRenderer" {
             if name.is_none() {
                 name = yt_text(val);
+            }
+        }
+        if page_id.is_none() && (key == "pageId" || key == "onBehalfOfUser") {
+            if let Some(pid) = val.as_str() {
+                if pid.len() >= 10 && pid.chars().all(|c| c.is_ascii_digit()) {
+                    page_id = Some(pid.to_string());
+                }
             }
         }
         if key == "accountPhoto" || key == "thumbnails" {
@@ -676,6 +864,7 @@ fn parse_account(v: &Value) -> Option<AccountInfo> {
         name,
         photo,
         handle,
+        page_id,
     })
 }
 
@@ -1056,6 +1245,78 @@ fn color_of(v: &Value) -> Option<String> {
     })
 }
 
+
+fn response_has_account(v: &Value) -> bool {
+    let mut ok = false;
+    walk(v, &mut |key, val| {
+        if matches!(
+            key,
+            "activeAccountHeaderRenderer"
+                | "accountButtonRenderer"
+                | "multiPageMenuRenderer"
+                | "accountName"
+        ) {
+            ok = true;
+        }
+        if key == "logged_in" && val.as_bool() == Some(true) {
+            ok = true;
+        }
+    });
+    ok
+}
+
+fn find_page_continuation(v: &Value) -> Option<String> {
+    let mut tok = None;
+    walk(v, &mut |key, val| {
+        if tok.is_none() && key == "sectionListRenderer" {
+            if let Some(arr) = val["contents"].as_array() {
+                for c in arr.iter().rev() {
+                    if c.get("continuationItemRenderer").is_some() {
+                        if let Some(t) = find_continuation(c) {
+                            tok = Some(t);
+                            break;
+                        }
+                    }
+                }
+            }
+            if tok.is_none() {
+                tok = find_continuation(&val["continuations"]);
+            }
+        }
+    });
+    tok
+}
+
+fn parse_continuation_items(v: &Value) -> (Vec<ShelfItem>, Option<String>) {
+    let mut items = Vec::new();
+    walk(v, &mut |key, val| {
+        if key == "continuationItems" || key == "contents" || key == "items" {
+            if let Some(arr) = val.as_array() {
+                for c in arr {
+                    if let Some(it) = parse_item(c) {
+                        items.push(it);
+                    }
+                }
+            }
+        }
+    });
+    if items.is_empty() {
+        let mut shelves = Vec::new();
+        collect_shelves(v, &mut shelves);
+        for s in shelves {
+            items.extend(s.items);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|it| {
+        if it.id.is_empty() {
+            return true;
+        }
+        seen.insert(it.id.clone())
+    });
+    (items, find_continuation(v))
+}
+
 fn find_continuation(v: &Value) -> Option<String> {
     let mut tok = None;
     walk(v, &mut |key, val| {
@@ -1119,4 +1380,104 @@ pub fn albums_from_browse(v: &Value) -> std::collections::HashMap<String, (Strin
         }
     });
     out
+}
+
+impl InnerTube {
+    /// Browse a library / likes page and collect tracks, playlists, albums, artists.
+    pub async fn library_browse(&self, browse_id: &str) -> Result<(Vec<Track>, Vec<PlaylistCard>, Vec<ArtistCard>)> {
+        let v = self.browse(browse_id, None).await?;
+        Ok(parse_library_page(&v))
+    }
+}
+
+pub fn parse_library_page(v: &Value) -> (Vec<Track>, Vec<PlaylistCard>, Vec<ArtistCard>) {
+    let mut shelves = Vec::new();
+    collect_shelves(v, &mut shelves);
+    // Also walk responsive list items that are not in a titled shelf.
+    let mut extra_tracks = Vec::new();
+    let mut extra_pls = Vec::new();
+    walk(v, &mut |key, val| {
+        if key == "musicResponsiveListItemRenderer" {
+            if let Some(item) = parse_responsive(val) {
+                if item.kind == "track" || item.kind == "video" {
+                    if let Some(t) = item.as_track() {
+                        extra_tracks.push(t);
+                    }
+                } else if item.kind == "playlist" || item.kind == "album" {
+                    extra_pls.push(crate::models::PlaylistCard {
+                        id: item.id.clone(),
+                        name: item.title.clone(),
+                        cover: item.cover.clone(),
+                        subtitle: item.subtitle.clone(),
+                        browse_id: item.browse_id.clone(),
+                        year: item.year,
+                        album_type: item.album_type.clone(),
+                        track_count: item.track_count,
+                        author: item.artists.first().cloned(),
+                        from_ytm: Some(true),
+                        color: item.color.clone(),
+                        params: item.params.clone(),
+                    });
+                }
+            }
+        }
+    });
+    let mut tracks = Vec::new();
+    let mut playlists = Vec::new();
+    let mut artists = Vec::new();
+    for s in &shelves {
+        for i in &s.items {
+            match i.kind.as_str() {
+                "track" | "video" => {
+                    if let Some(t) = i.as_track() {
+                        tracks.push(t);
+                    }
+                }
+                "playlist" | "album" => {
+                    playlists.push(crate::models::PlaylistCard {
+                        id: i.id.clone(),
+                        name: i.title.clone(),
+                        cover: i.cover.clone(),
+                        subtitle: i.subtitle.clone(),
+                        browse_id: i.browse_id.clone(),
+                        year: i.year,
+                        album_type: i.album_type.clone(),
+                        track_count: i.track_count,
+                        author: i.artists.first().cloned(),
+                        from_ytm: Some(true),
+                        color: i.color.clone(),
+                        params: i.params.clone(),
+                    });
+                }
+                "artist" => {
+                    artists.push(crate::models::ArtistCard {
+                        id: i.id.clone(),
+                        name: i.title.clone(),
+                        cover: i.cover.clone(),
+                        subscribers: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    tracks.extend(extra_tracks);
+    playlists.extend(extra_pls);
+    (dedup_tracks(tracks), dedup_playlists(playlists), dedup_artists(artists))
+}
+
+fn dedup_tracks(mut v: Vec<Track>) -> Vec<Track> {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|t| !t.id.is_empty() && seen.insert(t.id.clone()));
+    v
+}
+fn dedup_playlists(mut v: Vec<PlaylistCard>) -> Vec<PlaylistCard> {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|t| !t.id.is_empty() && seen.insert(t.id.clone()));
+    v
+}
+fn dedup_artists(mut v: Vec<ArtistCard>) -> Vec<ArtistCard> {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|t| !t.id.is_empty() && seen.insert(t.id.clone()));
+    v
 }

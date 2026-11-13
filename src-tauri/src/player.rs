@@ -63,6 +63,9 @@ pub struct Player {
     recovering: Arc<AtomicBool>,
     last_ended: Arc<Mutex<Option<String>>>,
     last_recover: Arc<Mutex<Option<Instant>>>,
+    /// Set by adopt_track after a successful blend; take_ended must not
+    /// also advance (that restarted the same song or skipped ahead).
+    blend_adopted: Arc<AtomicBool>,
 }
 
 impl Player {
@@ -86,6 +89,7 @@ impl Player {
         let recovering = Arc::new(AtomicBool::new(false));
         let last_ended = Arc::new(Mutex::new(None));
         let last_recover = Arc::new(Mutex::new(None));
+        let blend_adopted = Arc::new(AtomicBool::new(false));
 
         let samples_t = samples.clone();
         let rate_t = sample_rate.clone();
@@ -137,6 +141,7 @@ impl Player {
             recovering,
             last_ended,
             last_recover,
+            blend_adopted,
         }
     }
 
@@ -346,7 +351,19 @@ impl Player {
 
     pub fn adopt_track(&self, track: Track, index: usize) {
         self.ended.store(false, Ordering::Relaxed);
-        *self.last_ended.lock() = None;
+        // Remember the outgoing track so a late Ended from its decoder
+        // is not treated as "this (new) track finished".
+        let prev = self
+            .state
+            .lock()
+            .track
+            .as_ref()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        if !prev.is_empty() {
+            *self.last_ended.lock() = Some(prev);
+        }
+        self.blend_adopted.store(true, Ordering::SeqCst);
         let mut s = self.state.lock();
         s.track = Some(track);
         s.index = index;
@@ -454,6 +471,13 @@ impl Player {
     }
     pub fn take_ended(&self) -> bool {
         if self.blending.load(Ordering::Relaxed) {
+            self.ended.store(false, Ordering::Relaxed);
+            return false;
+        }
+        // Successful crossfade/gapless already adopted the next track.
+        // The outgoing decoder ending must not start another advance
+        // (that restarted the same song, or skipped one ahead).
+        if self.blend_adopted.swap(false, Ordering::SeqCst) {
             self.ended.store(false, Ordering::Relaxed);
             return false;
         }
@@ -825,4 +849,149 @@ fn make_source(
     start: f64,
 ) -> Result<crate::decode::AudioSource> {
     crate::decode::open(audio, start)
+}
+
+
+#[cfg(test)]
+mod crossfade_tests {
+    use super::*;
+    use crate::models::Track;
+
+    fn t(id: &str, title: &str) -> Track {
+        Track {
+            id: id.into(),
+            title: title.into(),
+            duration: Some(10),
+            ..Default::default()
+        }
+    }
+
+    fn queue(n: usize) -> Vec<Track> {
+        (0..n)
+            .map(|i| t(&format!("t{i}"), &format!("Track {i}")))
+            .collect()
+    }
+
+    fn arm(p: &Player, q: Vec<Track>, index: usize, pos: f64, dur: f64) {
+        p.prepare(q[index].clone(), q, index, pos, false);
+        p.state.lock().duration = dur;
+        p.state.lock().position = pos;
+        p.phase.store(1, Ordering::Relaxed);
+        p.samples.store(0, Ordering::Relaxed);
+        p.sample_rate.store(48000, Ordering::Relaxed);
+        p.channels.store(2, Ordering::Relaxed);
+        p.blending.store(false, Ordering::Relaxed);
+        p.blend_adopted.store(false, Ordering::Relaxed);
+        p.ended.store(false, Ordering::Relaxed);
+        *p.last_ended.lock() = None;
+    }
+
+    fn run_xf_across(p: &Player, q: Vec<Track>, repeat: &str, shuffle: bool) -> Vec<String> {
+        p.set_crossfade(true, 2.0, false);
+        p.set_repeat(repeat);
+        p.set_shuffle(shuffle);
+        let n = q.len();
+        arm(p, q.clone(), 0, 8.2, 10.0);
+        let mut order = vec![p.snapshot().track.unwrap().id.clone()];
+        let steps = if repeat == "one" { 3 } else { n + 2 };
+        for _ in 0..steps {
+            let Some((track, index, _style)) = p.blend_due() else {
+                // If blend didn't fire, simulate a natural end.
+                p.ended.store(true, Ordering::Relaxed);
+                if p.take_ended() {
+                    match p.next_choice(false) {
+                        NextChoice::Play(i) => {
+                            let q = p.queue_and_index().0;
+                            if let Some(t) = q.get(i).cloned() {
+                                arm(p, q, i, 8.2, 10.0);
+                                order.push(t.id);
+                            }
+                        }
+                        _ => break,
+                    }
+                } else {
+                    break;
+                }
+                continue;
+            };
+            // Adopt the blended-in track, then the outgoing decoder ends.
+            let id = track.id.clone();
+            p.adopt_track(track, index);
+            p.ended.store(true, Ordering::Relaxed);
+            let advanced = p.take_ended();
+            assert!(
+                !advanced,
+                "take_ended must not advance after a successful blend (would replay or skip); repeat={repeat} shuffle={shuffle}"
+            );
+            order.push(id);
+            // Sit near the end of the newly adopted track so the next blend fires.
+            p.state.lock().position = 8.2;
+            p.state.lock().duration = 10.0;
+            p.phase.store(1, Ordering::Relaxed);
+            p.samples.store(0, Ordering::Relaxed);
+            p.blending.store(false, Ordering::Relaxed);
+            // blend_adopted already cleared by take_ended
+        }
+        order
+    }
+
+    #[test]
+    fn crossfade_repeat_off_plays_each_once_then_stops() {
+        let p = Player::start();
+        let order = run_xf_across(&p, queue(5), "off", false);
+        assert_eq!(
+            order,
+            vec!["t0", "t1", "t2", "t3", "t4"],
+            "repeat-off must advance 0..4 and not restart t0 or repeat a song"
+        );
+    }
+
+    #[test]
+    fn crossfade_repeat_all_wraps_to_first() {
+        let p = Player::start();
+        let order = run_xf_across(&p, queue(5), "all", false);
+        assert_eq!(&order[..5], &["t0", "t1", "t2", "t3", "t4"][..]);
+        assert_eq!(order.get(5).map(String::as_str), Some("t0"), "repeat-all wraps");
+    }
+
+    #[test]
+    fn crossfade_repeat_one_stays_on_same() {
+        let p = Player::start();
+        let order = run_xf_across(&p, queue(5), "one", false);
+        assert!(order.len() >= 2, "got {order:?}");
+        assert!(
+            order.iter().all(|id| id == "t0"),
+            "repeat-one must keep the same track, got {order:?}"
+        );
+    }
+
+    #[test]
+    fn crossfade_shuffle_never_repeats_immediately() {
+        let p = Player::start();
+        let order = run_xf_across(&p, queue(5), "off", true);
+        assert!(order.len() >= 2, "got {order:?}");
+        for w in order.windows(2) {
+            assert_ne!(w[0], w[1], "shuffle must not pick the current track again: {order:?}");
+        }
+    }
+
+    #[test]
+    fn next_choice_repeat_off_all_one() {
+        let p = Player::start();
+        let q = queue(3);
+        arm(&p, q.clone(), 0, 1.0, 10.0);
+        p.set_repeat("off");
+        p.set_shuffle(false);
+        assert!(matches!(p.next_choice(false), NextChoice::Play(1)));
+        arm(&p, q.clone(), 2, 1.0, 10.0);
+        p.set_repeat("off");
+        p.set_autoplay(false);
+        assert!(matches!(p.next_choice(false), NextChoice::Stop));
+        p.set_autoplay(true);
+        assert!(matches!(p.next_choice(false), NextChoice::Autoplay));
+        p.set_repeat("all");
+        assert!(matches!(p.next_choice(false), NextChoice::Play(0)));
+        p.set_repeat("one");
+        assert!(matches!(p.next_choice(false), NextChoice::Play(2)));
+    }
 }

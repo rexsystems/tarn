@@ -1,4 +1,5 @@
 mod auth;
+mod diag;
 mod cache;
 mod color;
 pub mod decode;
@@ -54,6 +55,7 @@ impl App {
                     name: "Alex Stefan".into(),
                     photo: None,
                     handle: Some("@preview".into()),
+                    page_id: None,
                 }),
                 store: Some("mock".into()),
             }
@@ -163,6 +165,7 @@ fn mock_library() -> Library {
             name: "Alex Stefan".into(),
             photo: None,
             handle: Some("@preview".into()),
+            page_id: None,
         }),
         playlists: vec![
             models::PlaylistCard {
@@ -857,19 +860,36 @@ async fn open_login(app: State<'_, Arc<App>>, handle: AppHandle) -> Result<(), S
     let app_ref = app.inner().clone();
     login::open_login(handle, move |header| {
         let app_ref = app_ref.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = apply_session(&app_ref, header).await {
-                eprintln!("apply session: {e}");
-            }
+            let r = apply_session(&app_ref, header)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(r);
         });
+        match rx.recv_timeout(std::time::Duration::from_secs(25)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("timed out applying session".into()),
+        }
     })
     .map_err(|e| e.to_string())
 }
 
 async fn apply_session(app: &App, header: String) -> anyhow::Result<()> {
+    crate::diag::log(format!(
+        "apply_session: cookies={:?} complete={}",
+        crate::auth::header_cookie_names(&header),
+        crate::auth::session_complete_from_header(&header)
+    ));
     let kind = app.store.save(&header)?;
+    crate::diag::log(format!("apply_session: stored as {kind:?}"));
     app.ytm.set_cookie_header(Some(header)).await?;
     let account = app.ytm.account().await.ok().flatten();
+    crate::diag::log(format!(
+        "apply_session: account={}",
+        account.as_ref().map(|a| a.name.as_str()).unwrap_or("(none)")
+    ));
     let mut a = app.auth.lock();
     a.signed_in = true;
     a.mock = false;
@@ -879,6 +899,36 @@ async fn apply_session(app: &App, header: String) -> anyhow::Result<()> {
         auth::StoreKind::EncryptedFile => "encrypted_file".into(),
     });
     Ok(())
+}
+
+#[tauri::command]
+fn diagnostics(app: State<Arc<App>>) -> String {
+    let auth = app.auth.lock().clone();
+    let cookie = app.ytm.cookie_header();
+    let names = cookie
+        .as_deref()
+        .map(crate::auth::header_cookie_names)
+        .unwrap_or_default();
+    let ready = cookie
+        .as_deref()
+        .is_some_and(crate::auth::session_ready_from_header);
+    let complete = cookie
+        .as_deref()
+        .is_some_and(crate::auth::session_complete_from_header);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "tarn diagnostics\nsigned_in={} mock={} store={:?}\naccount={} handle={}\ncookie_names={:?}\nsession_ready={} session_complete={}\n\n",
+        auth.signed_in,
+        auth.mock,
+        auth.store,
+        auth.account.as_ref().map(|a| a.name.as_str()).unwrap_or("-"),
+        auth.account.as_ref().and_then(|a| a.handle.clone()).unwrap_or_default(),
+        names,
+        ready,
+        complete,
+    ));
+    out.push_str(&crate::diag::dump());
+    out
 }
 
 #[tauri::command]
@@ -982,9 +1032,7 @@ fn maybe_blend(app: &Arc<App>) {
         let id = track.id.clone();
         let result = async {
             let stream = app.ytm.stream(&id).await.map_err(|e| e.to_string())?;
-            if let Some(d) = stream.duration {
-                app.player.set_duration(d);
-            }
+            let next_dur = stream.duration;
             let audio = app
                 .ytm
                 .start_audio(&id, &stream)
@@ -994,6 +1042,12 @@ fn maybe_blend(app: &Arc<App>) {
                 .play_stream(stream, audio, 0.0, style)
                 .map_err(|e| e.to_string())?;
             app.player.adopt_track(track, index);
+            // Set the new track's duration only AFTER adopt, so we never
+            // shrink the outgoing track's duration mid-play (that made
+            // the same song look like it restarted).
+            if let Some(d) = next_dur {
+                app.player.set_duration(d);
+            }
             let (q, _) = app.player.queue_and_index();
             prefetch_ahead(&app, &q, index);
             Ok::<(), String>(())
@@ -1011,6 +1065,11 @@ fn emit_loop(handle: AppHandle, app: Arc<App>) {
         let mut last_save = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Some(header) = app.ytm.harvest_cookies() {
+                if let Err(e) = app.store.save(&header) {
+                    eprintln!("session persist (rotated cookies): {e}");
+                }
+            }
             maybe_blend(&app);
             if let Some((track, queue, index, pos, play)) = app.player.take_recover() {
                 let app2 = app.clone();
@@ -1150,6 +1209,7 @@ pub fn run() {
             auth_status,
             open_login,
             sign_out,
+            diagnostics,
             get_settings,
             set_settings,
             extract_cookie_names,

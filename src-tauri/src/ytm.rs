@@ -35,6 +35,7 @@ pub struct Ytm {
     country: Mutex<String>,
     quality: Mutex<String>,
     cookie: Mutex<Option<String>>,
+    page_id: Mutex<Option<String>>,
     cookies_file: PathBuf,
     streams: Mutex<std::collections::HashMap<String, CachedStream>>,
     bodies: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::decode::GrowingBody>>>,
@@ -67,6 +68,7 @@ impl Ytm {
             country: Mutex::new("US".into()),
             quality: Mutex::new("high".into()),
             cookie: Mutex::new(None),
+            page_id: Mutex::new(None),
             cookies_file,
             streams: Mutex::new(std::collections::HashMap::new()),
             bodies: Mutex::new(std::collections::HashMap::new()),
@@ -87,7 +89,33 @@ impl Ytm {
     }
 
     pub fn cookie_header(&self) -> Option<String> {
+        self.harvest_cookies();
         self.cookie.lock().unwrap().clone()
+    }
+
+    /// Apply any Set-Cookie values InnerTube captured (SIDCC rotation).
+    /// Returns the new header when it changed, so the caller can persist it.
+    pub fn harvest_cookies(&self) -> Option<String> {
+        let lines = crate::auth::take_set_cookies();
+        if lines.is_empty() {
+            return None;
+        }
+        let mut g = self.cookie.lock().unwrap();
+        let h = g.as_mut()?;
+        let before = h.clone();
+        for line in &lines {
+            *h = crate::auth::merge_set_cookie(h, line);
+        }
+        if *h != before {
+            let names: Vec<_> = lines
+                .iter()
+                .filter_map(|l| l.split('=').next())
+                .collect();
+            crate::diag::log(format!("cookies rotated: {names:?}"));
+            Some(h.clone())
+        } else {
+            None
+        }
     }
 
     pub async fn set_cookie_header(&self, header: Option<String>) -> Result<()> {
@@ -107,18 +135,36 @@ impl Ytm {
                 let _ = self.rp.user_auth_remove_cookie().await;
                 auth::remove_file_quiet(&self.cookies_file);
                 *self.cookie.lock().unwrap() = None;
+                *self.page_id.lock().unwrap() = None;
             }
         }
         Ok(())
     }
 
     fn it(&self) -> InnerTube {
-        InnerTube::new(
-            self.http.clone(),
-            self.cookie_header(),
-            self.lang.lock().unwrap().clone(),
-            self.country.lock().unwrap().clone(),
-        )
+        let cookie = self.cookie_header();
+        let (lang, region) = self.request_locale(cookie.as_deref());
+        InnerTube::new(self.http.clone(), cookie, lang, region)
+            .with_page_id(self.page_id.lock().unwrap().clone())
+    }
+
+    /// Prefer the account's PREF hl/gl when settings are still the en/US default,
+    /// so a signed-in Home matches music.youtube.com for that account.
+    fn request_locale(&self, cookie: Option<&str>) -> (String, String) {
+        let lang = self.lang.lock().unwrap().clone();
+        let region = self.country.lock().unwrap().clone();
+        let defaulted = lang == "en" && region.eq_ignore_ascii_case("US");
+        if defaulted {
+            if let Some(c) = cookie {
+                if let Some((hl, gl)) = auth::locale_from_pref(c) {
+                    crate::diag::log(format!(
+                        "innertube locale from PREF: hl={hl} gl={gl} (settings were {lang}/{region})"
+                    ));
+                    return (hl, gl);
+                }
+            }
+        }
+        (lang, region)
     }
 
     fn quality(&self) -> String {
@@ -259,12 +305,25 @@ impl Ytm {
             Ok(h) if !h.shelves.is_empty() => h,
             Ok(h) => h,
             Err(e) => {
-                eprintln!("home browse: {e}");
+                crate::diag::log(format!("home browse: {e}"));
                 Home::default()
             }
         };
-        // Always enrich with charts / new releases when those shelves are missing,
-        // so a logged-out session still feels full.
+        let signed = self.cookie_header().is_some();
+        home.signed_in = signed;
+        self.harvest_cookies();
+        // When signed in, the InnerTube feed IS the product — do not pad
+        // it with the logged-out charts/trending filler.
+        if signed {
+            crate::diag::log(format!(
+                "home feed (signed-in): {} shelves, {} chips",
+                home.shelves.len(),
+                home.chips.len()
+            ));
+            return Ok(home);
+        }
+        // Logged-out: enrich with charts / new releases when those shelves
+        // are missing, so a guest session still feels full.
         let has = |h: &Home, needle: &str| {
             h.shelves
                 .iter()
@@ -377,6 +436,16 @@ impl Ytm {
                 Explore::default()
             }
         };
+        let signed = self.cookie_header().is_some();
+        if signed {
+            crate::diag::log(format!(
+                "explore feed (signed-in): {} shelves, {} moods, {} links",
+                ex.shelves.len(),
+                ex.moods.len(),
+                ex.links.len()
+            ));
+            return Ok(ex);
+        }
         if ex.shelves.is_empty() {
             if let Ok(albums) = self.rp.query().music_new_albums().await {
                 ex.shelves.push(Shelf {
@@ -746,12 +815,7 @@ impl Ytm {
         } else {
             format!("VL{}", c.id)
         };
-        let it = InnerTube::new(
-            self.http.clone(),
-            self.cookie.lock().unwrap().clone(),
-            self.lang.lock().unwrap().clone(),
-            self.country.lock().unwrap().clone(),
-        );
+        let it = self.it();
         let body = it.browse(&browse_id, None).await?;
         let albums = innertube::albums_from_browse(&body);
         if albums.is_empty() {
@@ -879,7 +943,19 @@ impl Ytm {
     }
 
     pub async fn account(&self) -> Result<Option<AccountInfo>> {
-        self.it().account_menu().await
+        let acc = self.it().account_menu().await?;
+        if let Some(ref a) = acc {
+            *self.page_id.lock().unwrap() = a.page_id.clone();
+            crate::diag::log(format!(
+                "account: name={} handle={} page_id={}",
+                a.name,
+                a.handle.as_deref().unwrap_or("-"),
+                a.page_id.as_deref().map(|_| "set").unwrap_or("none")
+            ));
+        } else {
+            crate::diag::log("account: account_menu returned none");
+        }
+        Ok(acc)
     }
 
     pub async fn like(&self, video_id: &str, action: &str) -> Result<LikeState> {
@@ -919,39 +995,124 @@ impl Ytm {
 
     pub async fn library(&self) -> Result<Library> {
         if self.cookie_header().is_none() {
+            crate::diag::log("library: no cookie, returning signed_in=false");
             return Ok(Library {
                 signed_in: false,
                 ..Default::default()
             });
         }
         let account = self.account().await.ok().flatten();
+        crate::diag::log(format!(
+            "library: account={}",
+            account.as_ref().map(|a| a.name.as_str()).unwrap_or("(none)")
+        ));
         let mut lib = Library {
             signed_in: true,
             mock: false,
             account,
             ..Default::default()
         };
-        if let Ok(p) = self.rp.query().music_saved_playlists().await {
-            lib.playlists = p.items.iter().map(playlist_from).collect();
+        // rustypipe first, but it often returns empty / errors when the
+        // cookie jar is slightly off. Fall through to InnerTube browses
+        // that match music.youtube.com itself.
+        match self.rp.query().music_saved_playlists().await {
+            Ok(p) => lib.playlists = p.items.iter().map(playlist_from).collect(),
+            Err(e) => crate::diag::log(format!("library rustypipe playlists: {e}")),
         }
-        if let Ok(a) = self.rp.query().music_saved_albums().await {
-            lib.albums = a.items.iter().map(album_from).collect();
+        match self.rp.query().music_saved_albums().await {
+            Ok(a) => lib.albums = a.items.iter().map(album_from).collect(),
+            Err(e) => crate::diag::log(format!("library rustypipe albums: {e}")),
         }
-        if let Ok(a) = self.rp.query().music_saved_artists().await {
-            lib.artists = a.items.iter().map(artist_from).collect();
+        match self.rp.query().music_saved_artists().await {
+            Ok(a) => lib.artists = a.items.iter().map(artist_from).collect(),
+            Err(e) => crate::diag::log(format!("library rustypipe artists: {e}")),
         }
-        if let Ok(liked) = self.rp.query().music_liked_tracks().await {
-            lib.liked = liked.tracks.items.iter().map(track_from).collect();
-        } else if let Ok(t) = self.rp.query().music_saved_tracks().await {
-            lib.liked = t.items.iter().map(track_from).collect();
+        match self.rp.query().music_liked_tracks().await {
+            Ok(liked) => lib.liked = liked.tracks.items.iter().map(track_from).collect(),
+            Err(e) => {
+                crate::diag::log(format!("library rustypipe liked: {e}"));
+                match self.rp.query().music_saved_tracks().await {
+                    Ok(t) => lib.liked = t.items.iter().map(track_from).collect(),
+                    Err(e2) => crate::diag::log(format!("library rustypipe saved tracks: {e2}")),
+                }
+            }
         }
-        if let Ok(h) = self.rp.query().music_history().await {
-            lib.recents = h
-                .items
-                .iter()
-                .map(|hi| track_from(&hi.item))
-                .collect();
+        match self.rp.query().music_history().await {
+            Ok(h) => {
+                lib.recents = h.items.iter().map(|hi| track_from(&hi.item)).collect();
+            }
+            Err(e) => crate::diag::log(format!("library rustypipe history: {e}")),
         }
+
+        let it = self.it();
+        // Liked songs
+        if lib.liked.is_empty() {
+            match it.library_browse("FEmusic_liked_videos").await {
+                Ok((tracks, _, _)) => {
+                    crate::diag::log(format!("library innertube liked_videos: {} tracks", tracks.len()));
+                    lib.liked = tracks;
+                }
+                Err(e) => crate::diag::log(format!("library innertube liked_videos: {e}")),
+            }
+        }
+        // Liked / saved playlists
+        if lib.playlists.is_empty() {
+            for id in [
+                "FEmusic_liked_playlists",
+                "FEmusic_library_landing",
+            ] {
+                match it.library_browse(id).await {
+                    Ok((_, pls, _)) if !pls.is_empty() => {
+                        crate::diag::log(format!("library innertube {id}: {} playlists", pls.len()));
+                        // landing may mix albums — keep playlist-looking ids
+                        for p in pls {
+                            if lib.playlists.iter().any(|x| x.id == p.id) {
+                                continue;
+                            }
+                            lib.playlists.push(p);
+                        }
+                    }
+                    Ok((_, _, _)) => crate::diag::log(format!("library innertube {id}: empty")),
+                    Err(e) => crate::diag::log(format!("library innertube {id}: {e}")),
+                }
+            }
+        }
+        if lib.albums.is_empty() {
+            match it.library_browse("FEmusic_library_corpus_track_albums").await {
+                Ok((_, albs, _)) => {
+                    crate::diag::log(format!("library innertube albums: {}", albs.len()));
+                    lib.albums = albs;
+                }
+                Err(e) => crate::diag::log(format!("library innertube albums: {e}")),
+            }
+        }
+        if lib.artists.is_empty() {
+            match it.library_browse("FEmusic_library_corpus_track_artists").await {
+                Ok((_, _, arts)) => {
+                    crate::diag::log(format!("library innertube artists: {}", arts.len()));
+                    lib.artists = arts;
+                }
+                Err(e) => crate::diag::log(format!("library innertube artists: {e}")),
+            }
+        }
+        if lib.recents.is_empty() {
+            match it.library_browse("FEmusic_history").await {
+                Ok((tracks, _, _)) => {
+                    crate::diag::log(format!("library innertube history: {}", tracks.len()));
+                    lib.recents = tracks;
+                }
+                Err(e) => crate::diag::log(format!("library innertube history: {e}")),
+            }
+        }
+        self.harvest_cookies();
+        crate::diag::log(format!(
+            "library done: liked={} playlists={} albums={} artists={} recents={}",
+            lib.liked.len(),
+            lib.playlists.len(),
+            lib.albums.len(),
+            lib.artists.len(),
+            lib.recents.len()
+        ));
         Ok(lib)
     }
 
@@ -1034,10 +1195,14 @@ impl Ytm {
     }
 
     async fn resolve_stream_excluding(&self, video_id: &str, skip: &[&str]) -> Result<Stream> {
-        match rustypipe_stream(&self.rp, video_id, skip).await {
-            Ok(s) => return Ok(s),
-            Err(e) => eprintln!("rustypipe stream: {e}"),
-        }
+        let id = video_id.to_string();
+        let rp = self.rp.clone();
+        let skip_owned: Vec<String> = skip.iter().map(|s| (*s).to_string()).collect();
+        let rustypipe_fut = async {
+            let skip_ref: Vec<&str> = skip_owned.iter().map(|s| s.as_str()).collect();
+            rustypipe_stream(&rp, &id, &skip_ref).await
+        };
+
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if !skip.contains(&"yt-dlp") {
@@ -1047,10 +1212,39 @@ impl Ytm {
                     None
                 };
                 let q = self.quality();
+                let vid = video_id.to_string();
+                let ytdlp_fut = async move {
+                    // Give rustypipe a head start; start yt-dlp after 800ms
+                    // so a fast iOS/TV URL wins, but a slow one does not
+                    // block the sidecar.
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    ytdlp_stream(&vid, cookies.as_deref(), &q).await
+                };
+                tokio::select! {
+                    Ok(s) = rustypipe_fut => {
+                        crate::diag::log(format!("resolve {video_id}: rustypipe {} won", s.label()));
+                        return Ok(s);
+                    }
+                    Ok(s) = ytdlp_fut => {
+                        crate::diag::log(format!("resolve {video_id}: yt-dlp won (sidecar)"));
+                        return Ok(s);
+                    }
+                    else => {}
+                }
+                // Both failed (or rustypipe failed before 800ms and yt-dlp
+                // is not in this select branch). Try yt-dlp directly if
+                // rustypipe already lost.
+                let cookies = if self.cookies_file.exists() {
+                    Some(self.cookies_file.clone())
+                } else {
+                    None
+                };
+                let q = self.quality();
                 return ytdlp_stream(video_id, cookies.as_deref(), &q).await;
             }
         }
-        Err(anyhow!("no playable stream"))
+
+        rustypipe_fut.await
     }
 
     /// Start a progressive download and return once enough of the file is
@@ -2113,9 +2307,37 @@ fn headers_for(rp: &RustyPipe, ctype: ClientType) -> Vec<(String, String)> {
 
 async fn rustypipe_stream(rp: &RustyPipe, id: &str, skip: &[&str]) -> Result<Stream> {
     // iOS and TV return unobfuscated URLs and do not need a PO token.
-    // Then Android, web_music, web, and mobile. Each is requested
-    // separately, and once more on a transient failure, so we only
-    // surface an error after every client has been tried.
+    // Race those two and take the first success; then Android, web_music,
+    // web, and mobile, so we only surface an error after every client.
+    let mut skip: Vec<&str> = skip.to_vec();
+    if !skip.iter().any(|s| *s == "ios" || *s == "tv") {
+        let ios = rustypipe_one(rp, id, ClientType::Ios);
+        let tv = rustypipe_one(rp, id, ClientType::Tv);
+        tokio::pin!(ios, tv);
+        let mut ios_done = false;
+        let mut tv_done = false;
+        loop {
+            tokio::select! {
+                r = &mut ios, if !ios_done => {
+                    ios_done = true;
+                    skip.push("ios");
+                    match r {
+                        Ok(s) => return Ok(s),
+                        Err(e) => eprintln!("rustypipe ios (race): {e}"),
+                    }
+                }
+                r = &mut tv, if !tv_done => {
+                    tv_done = true;
+                    skip.push("tv");
+                    match r {
+                        Ok(s) => return Ok(s),
+                        Err(e) => eprintln!("rustypipe tv (race): {e}"),
+                    }
+                }
+                else => break,
+            }
+        }
+    }
     let order = [
         ClientType::Ios,
         ClientType::Tv,
