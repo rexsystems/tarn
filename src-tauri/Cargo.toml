@@ -1,0 +1,51 @@
+[package]
+name = "tarn"
+version = "0.1.0"
+description = "YouTube Music desktop client"
+authors = ["Alex Stefan"]
+license = "GPL-3.0-only"
+edition = "2021"
+default-run = "tarn"
+
+[lib]
+name = "tarn_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "tarn"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rustypipe = { version = "0.11", features = ["userdata"] }
+rodio = "0.20"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+anyhow = "1"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+parking_lot = "0.12"
+keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+sha1 = "0.10"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+url = "2"
+souvlaki = "0.7"
+notify-rust = "4"
+
+[profile.release]
+lto = false
+codegen-units = 8
+opt-level = 3
+strip = true

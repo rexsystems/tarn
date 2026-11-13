@@ -1,0 +1,47 @@
+# dependencies and build output
+node_modules/
+dist/
+dist-out/
+src-tauri/target/
+src-tauri/gen/*/build/
+*.AppImage
+*.rpm
+*.deb
+*.msi
+*.exe
+*.dmg
+*.apk
+*.aab
+*.ipa
+
+# local env and secrets — never commit these
+.env
+.env.*
+!.env.example
+yt-cookies.txt
+**/*cookies*.txt
+**/*session*
+*.pem
+*.p12
+*.key
+*.mobileprovision
+auth-test-*/
+
+# caches
+.cache/
+*.tsbuildinfo
+.vite/
+.svelte-kit/
+
+# local screenshots (README shots live under docs/)
+screenshots/
+/tmp/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml

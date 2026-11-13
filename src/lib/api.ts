@@ -1,0 +1,56 @@
+import { invoke } from '@tauri-apps/api/core';
+import type {
+  ArtistPage, AuthStatus, Collection, Explore, GenrePage, Home, Library,
+  LikeState, Lyrics, PlayerState, Related, SearchResults, Settings, Track,
+} from './types';
+
+export const api = {
+  searchAll: (query: string) => invoke<SearchResults>('search_all', { query }),
+  searchTracks: (query: string) => invoke<Track[]>('search_tracks', { query }),
+  suggestions: (query: string) => invoke<string[]>('search_suggestions', { query }),
+  home: (params?: string | null) => invoke<Home>('get_home', { params: params ?? null }),
+  explore: () => invoke<Explore>('get_explore'),
+  genre: (id: string) => invoke<GenrePage>('get_genre', { id }),
+  charts: () => invoke<Home>('get_charts'),
+  newReleases: () => invoke<Home>('get_new_releases'),
+  artist: (id: string) => invoke<ArtistPage>('get_artist', { id }),
+  album: (id: string) => invoke<Collection>('get_album', { id }),
+  playlist: (id: string) => invoke<Collection>('get_playlist', { id }),
+  lyrics: (id: string) => invoke<Lyrics>('get_lyrics', { id }),
+  related: (id: string) => invoke<Related>('get_related', { id }),
+  play: (track: Track, queue: Track[], index: number) =>
+    invoke<void>('play', { track, queue, index }),
+  radio: (id: string) => invoke<void>('start_radio', { id }),
+  artistRadio: (radioId: string) => invoke<void>('start_artist_radio', { radioId }),
+  pause: () => invoke<void>('pause'),
+  resume: () => invoke<void>('resume'),
+  toggle: () => invoke<void>('toggle'),
+  seek: (seconds: number) => invoke<void>('seek', { seconds }),
+  setVolume: (volume: number) => invoke<void>('set_volume', { volume }),
+  state: () => invoke<PlayerState>('get_state'),
+  next: () => invoke<void>('next'),
+  prev: () => invoke<void>('prev'),
+  setShuffle: (on: boolean) => invoke<void>('set_shuffle', { on }),
+  setRepeat: (mode: string) => invoke<void>('set_repeat', { mode }),
+  cycleRepeat: () => invoke<string>('cycle_repeat'),
+  queueAdd: (tracks: Track[], next: boolean) => invoke<void>('queue_add', { tracks, next }),
+  queueRemove: (index: number) => invoke<void>('queue_remove', { index }),
+  queueMove: (from: number, to: number) => invoke<void>('queue_move', { from, to }),
+  like: (id: string, action: string) => invoke<LikeState>('like_track', { id, action }),
+  subscribe: (id: string, on: boolean) => invoke<void>('subscribe_artist', { id, on }),
+  playlistCreate: (title: string) => invoke<string>('playlist_create', { title }),
+  playlistAdd: (playlistId: string, videoId: string) =>
+    invoke<void>('playlist_add', { playlistId, videoId }),
+  playlistRemove: (playlistId: string, videoId: string) =>
+    invoke<void>('playlist_remove', { playlistId, videoId }),
+  playlistRename: (playlistId: string, title: string) =>
+    invoke<void>('playlist_rename', { playlistId, title }),
+  librarySave: (id: string, save: boolean) => invoke<void>('library_save', { id, save }),
+  library: () => invoke<Library>('get_library'),
+  history: () => invoke<Track[]>('get_history'),
+  auth: () => invoke<AuthStatus>('auth_status'),
+  openLogin: () => invoke<void>('open_login'),
+  signOut: () => invoke<void>('sign_out'),
+  settings: () => invoke<Settings>('get_settings'),
+  setSettings: (settings: Settings) => invoke<void>('set_settings', { settings }),
+};
