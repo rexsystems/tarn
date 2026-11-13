@@ -1,11 +1,13 @@
 mod auth;
 mod color;
+mod decode;
 mod innertube;
 mod login;
 mod mpris;
 mod models;
-mod player;
-mod ytm;
+pub mod player;
+pub mod ytdlp;
+pub mod ytm;
 
 use std::sync::Arc;
 
@@ -299,7 +301,17 @@ async fn start_playback(
             if let Some(d) = stream.duration {
                 app.player.set_duration(d);
             }
-            app.player.play_stream(stream, 0.0).map_err(|e| e.to_string())
+            match app.ytm.fetch_audio(&stream).await {
+                Ok(audio) => app
+                    .player
+                    .play_stream(stream, audio, 0.0)
+                    .map_err(|e| e.to_string()),
+                Err(e) => {
+                    let msg = short_err(&e.to_string());
+                    app.player.set_error(msg.clone());
+                    Err(msg)
+                }
+            }
         }
         Err(e) => {
             let msg = short_err(&e.to_string());
@@ -658,6 +670,9 @@ pub fn run() {
             let app_restore = app.clone();
             tauri::async_runtime::spawn(async move {
                 restore_session(&app_restore).await;
+            });
+            tauri::async_runtime::spawn(async {
+                crate::ytdlp::maybe_update().await;
             });
             emit_loop(handle.clone(), app.clone());
             mpris::start(app.clone(), handle.clone());

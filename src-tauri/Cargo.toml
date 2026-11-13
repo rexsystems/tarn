@@ -28,7 +28,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 rustypipe = { version = "0.11", features = ["userdata"] }
-rodio = "0.20"
+rodio = { version = "0.20", features = ["symphonia-isomp4", "symphonia-aac"] }
+symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4", "mp3"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 anyhow = "1"
 dirs = "6"

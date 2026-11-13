@@ -11,15 +11,7 @@ A fast YouTube Music desktop client. Built with Tauri 2, Rust, and Svelte. Works
 
 Downloads are on the [releases](https://github.com/rexsystems/tarn/releases) page: AppImage, rpm and deb for Linux, NSIS/MSI for Windows, dmg for macOS.
 
-Playback needs [ffmpeg](https://ffmpeg.org/) and [yt-dlp](https://github.com/yt-dlp/yt-dlp) on your `PATH`. The Linux packages pull them in as dependencies; on other platforms, install them yourself:
-
-```
-# Fedora
-sudo dnf install ffmpeg yt-dlp
-
-# Debian / Ubuntu
-sudo apt install ffmpeg yt-dlp
-```
+Tarn is self-contained. You do not need to install ffmpeg, yt-dlp, or any other extra tools — audio is decoded in-process, and a current yt-dlp is bundled and updated automatically.
 
 ## Build
 
@@ -39,6 +31,8 @@ npm run tauri build
 ```
 
 Packages land in `src-tauri/target/release/bundle/`. For a dev session: `npm run tauri dev`.
+
+The build downloads an official [yt-dlp](https://github.com/yt-dlp/yt-dlp) sidecar automatically; ffmpeg is not used. End users of the packages don't need either.
 
 ## License
 

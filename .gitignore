@@ -45,3 +45,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.iml
+
+# fetched at build time from official yt-dlp releases (Tauri sidecar)
+src-tauri/binaries/yt-dlp*
+!src-tauri/binaries/.gitkeep

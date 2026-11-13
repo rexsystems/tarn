@@ -7,7 +7,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::{
-    AlbumItem, AlbumType, ArtistItem, MusicItem, MusicPlaylistItem, Thumbnail, TrackItem, TrackType,
+    AlbumItem, AlbumType, ArtistItem, AudioCodec, AudioFormat, MusicItem, MusicPlaylistItem,
+    Thumbnail, TrackItem, TrackType,
 };
 use rustypipe::model::richtext::ToPlaintext;
 use serde_json::Value;
@@ -878,20 +879,68 @@ impl Ytm {
         Ok(h.items.iter().map(|hi| track_from(&hi.item)).collect())
     }
 
-    /// Resolve a playable audio stream URL. yt-dlp first — rustypipe's player
-    /// endpoint often trips YouTube's bot check.
+    /// Resolve a playable audio stream URL.
+    ///
+    /// On desktop, the bundled (or auto-updated) yt-dlp sidecar is tried first
+    /// because it stays current with YouTube's player changes. rustypipe is the
+    /// fallback, and the only path on Android/iOS (where we cannot run a sidecar).
+    /// rustypipe-botguard is a separate browser-simulation CLI, not an in-process
+    /// crate, so it is not bundled; rustypipe's iOS/TV clients work without PO tokens.
     pub async fn stream(&self, video_id: &str) -> Result<Stream> {
-        let cookies = if self.cookies_file.exists() {
-            Some(self.cookies_file.clone())
-        } else {
-            None
-        };
-        let q = self.quality();
-        match ytdlp_stream(video_id, cookies.as_deref(), &q).await {
-            Ok(s) => return Ok(s),
-            Err(e) => eprintln!("yt-dlp stream: {e}"),
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let cookies = if self.cookies_file.exists() {
+                Some(self.cookies_file.clone())
+            } else {
+                None
+            };
+            let q = self.quality();
+            match ytdlp_stream(video_id, cookies.as_deref(), &q).await {
+                Ok(s) => return Ok(s),
+                Err(e) => eprintln!("yt-dlp stream: {e}"),
+            }
         }
         rustypipe_stream(&self.rp, video_id).await
+    }
+
+    /// Download the full audio payload so the player can decode and seek
+    /// in-process (no ffmpeg).
+    pub async fn fetch_audio(&self, stream: &Stream) -> Result<std::sync::Arc<Vec<u8>>> {
+        // A dedicated client: googlevideo often stalls on HTTP/2 and throttles
+        // hard unless a Range request is used (HTTP 206).
+        let client = reqwest::Client::builder()
+            .user_agent(user_agent())
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(Duration::from_secs(90))
+            .build()?;
+        let mut req = client.get(&stream.url);
+        let mut has_range = false;
+        for (k, v) in &stream.headers {
+            if k.eq_ignore_ascii_case("range") {
+                has_range = true;
+            }
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if !has_range {
+            req = req.header("Range", "bytes=0-");
+        }
+        let resp = req.send().await.context("audio download")?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("audio download: HTTP {status}"));
+        }
+        let bytes = resp.bytes().await.context("audio body")?;
+        if bytes.len() < 64 {
+            return Err(anyhow!("audio download too small ({} bytes)", bytes.len()));
+        }
+        eprintln!(
+            "audio: {} bytes from {} ({})",
+            bytes.len(),
+            stream.source,
+            stream.mime.as_deref().unwrap_or("?")
+        );
+        Ok(std::sync::Arc::new(bytes.to_vec()))
     }
 }
 
@@ -1126,10 +1175,19 @@ async fn rustypipe_stream(rp: &RustyPipe, id: &str) -> Result<Stream> {
 }
 
 fn pick_audio(streams: &[rustypipe::model::AudioStream]) -> Option<&rustypipe::model::AudioStream> {
+    // Prefer AAC/m4a: rodio+symphonia decodes it in-process. Opus/webm is a
+    // weaker fallback because we do not ship a native opus decoder.
+    let usable = |s: &&rustypipe::model::AudioStream| s.drm_systems.is_empty() && !s.url.is_empty();
+    let aac = |s: &rustypipe::model::AudioStream| {
+        matches!(s.codec, AudioCodec::Mp4a)
+            || matches!(s.format, AudioFormat::M4a)
+            || s.mime.to_ascii_lowercase().contains("mp4")
+            || s.mime.to_ascii_lowercase().contains("aac")
+    };
     streams
         .iter()
-        .filter(|s| s.drm_systems.is_empty() && !s.url.is_empty())
-        .max_by_key(|s| s.average_bitrate.max(s.bitrate))
+        .filter(usable)
+        .max_by_key(|s| (aac(s), s.average_bitrate.max(s.bitrate)))
 }
 
 pub fn user_agent() -> String {
@@ -1137,10 +1195,11 @@ pub fn user_agent() -> String {
 }
 
 fn format_for(quality: &str) -> &'static str {
+    // Always prefer m4a/AAC so the in-process decoder (symphonia) can handle it.
     match quality {
-        "low" => "worstaudio[ext=m4a]/worstaudio/bestaudio",
-        "medium" => "bestaudio[abr<=140][ext=m4a]/bestaudio[abr<=140]/bestaudio",
-        _ => "bestaudio[ext=m4a]/bestaudio[acodec*=opus]/bestaudio/best",
+        "low" => "worstaudio[ext=m4a]/worstaudio[acodec=aac]/bestaudio[ext=m4a]/bestaudio",
+        "medium" => "bestaudio[abr<=140][ext=m4a]/bestaudio[ext=m4a]/bestaudio",
+        _ => "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio",
     }
 }
 
@@ -1149,8 +1208,11 @@ async fn ytdlp_stream(
     cookies: Option<&std::path::Path>,
     quality: &str,
 ) -> Result<Stream> {
+    let bin = crate::ytdlp::ensure()
+        .await
+        .context("yt-dlp sidecar is not available")?;
     let url = format!("https://www.youtube.com/watch?v={id}");
-    let mut cmd = Command::new("yt-dlp");
+    let mut cmd = Command::new(&bin);
     cmd.arg("--no-warnings").arg("--no-playlist").arg("-f").arg(format_for(quality));
     if let Some(p) = cookies {
         cmd.arg("--cookies").arg(p);
@@ -1161,7 +1223,7 @@ async fn ytdlp_stream(
         .stderr(Stdio::piped())
         .output()
         .await
-        .context("yt-dlp missing — install yt-dlp and put it on PATH")?;
+        .with_context(|| format!("run yt-dlp at {}", bin.display()))?;
     if !out.status.success() {
         return Err(anyhow!(
             "yt-dlp: {}",
@@ -1203,12 +1265,15 @@ async fn ytdlp_stream(
 }
 
 async fn search_ytdlp(query: &str) -> Result<Vec<Track>> {
+    let bin = crate::ytdlp::ensure()
+        .await
+        .context("yt-dlp sidecar is not available")?;
     let q = format!("ytsearch12:{query}");
-    let out = Command::new("yt-dlp")
+    let out = Command::new(&bin)
         .args(["--no-warnings", "--flat-playlist", "-j", "--", &q])
         .output()
         .await
-        .context("yt-dlp missing")?;
+        .with_context(|| format!("run yt-dlp at {}", bin.display()))?;
     if !out.status.success() {
         return Err(anyhow!(
             "search failed: {}",

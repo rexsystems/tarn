@@ -63,7 +63,7 @@ jobs:
           releaseBody: |
             Desktop packages for this tag are attached below.
 
-            Playback needs [ffmpeg](https://ffmpeg.org/) and [yt-dlp](https://github.com/yt-dlp/yt-dlp) on your PATH (the Linux packages declare them as dependencies).
+            Tarn is self-contained — you do not need to install ffmpeg, yt-dlp, or any other extra tools.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

@@ -1,6 +1,4 @@
-use std::io::{Read, Result as IoResult};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +11,7 @@ use crate::ytm::Stream;
 
 /// Commands sent to the audio thread.
 enum Cmd {
-    Play(Stream, f64),
+    Play(Arc<Vec<u8>>, f64),
     Pause,
     Resume,
     Stop,
@@ -24,13 +22,15 @@ enum Cmd {
 pub struct Player {
     tx: std::sync::mpsc::Sender<Cmd>,
     state: Arc<Mutex<PlayerState>>,
-    /// Playback position in samples (f32 frames * channels) from the start of the current source,
-    /// plus `base_position` (seek offset) stored in state.
+    /// Playback position in samples (f32 interleaved) from the start of the
+    /// current source, plus the seek origin stored in `state.position`.
     samples: Arc<AtomicU64>,
+    sample_rate: Arc<AtomicU32>,
+    channels: Arc<AtomicU32>,
     ended: Arc<AtomicBool>,
     /// 0 = idle, 1 = playing, 2 = paused, 3 = loading
     phase: Arc<AtomicU8>,
-    current_stream: Arc<Mutex<Option<Stream>>>,
+    current_audio: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
 }
 
 impl Player {
@@ -38,38 +38,47 @@ impl Player {
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let samples = Arc::new(AtomicU64::new(0));
+        let sample_rate = Arc::new(AtomicU32::new(44100));
+        let channels = Arc::new(AtomicU32::new(2));
         let ended = Arc::new(AtomicBool::new(false));
         let phase = Arc::new(AtomicU8::new(0));
-        let current_stream = Arc::new(Mutex::new(None));
+        let current_audio = Arc::new(Mutex::new(None));
 
         let samples_t = samples.clone();
+        let rate_t = sample_rate.clone();
+        let ch_t = channels.clone();
         let ended_t = ended.clone();
         let phase_t = phase.clone();
-        let stream_t = current_stream.clone();
+        let audio_t = current_audio.clone();
         let state_t = state.clone();
 
         std::thread::Builder::new()
             .name("tarn-audio".into())
-            .spawn(move || audio_thread(rx, samples_t, ended_t, phase_t, stream_t, state_t))
+            .spawn(move || {
+                audio_thread(rx, samples_t, rate_t, ch_t, ended_t, phase_t, audio_t, state_t)
+            })
             .expect("audio thread");
 
         Self {
             tx,
             state,
             samples,
+            sample_rate,
+            channels,
             ended,
             phase,
-            current_stream,
+            current_audio,
         }
     }
 
     pub fn snapshot(&self) -> PlayerState {
         let mut s = self.state.lock().clone();
-        let rate = 44100.0 * 2.0;
+        let rate = self.sample_rate.load(Ordering::Relaxed).max(1) as f64
+            * self.channels.load(Ordering::Relaxed).max(1) as f64;
         let extra = self.samples.load(Ordering::Relaxed) as f64 / rate;
         // `position` in state is the seek origin; add consumed samples.
         if self.phase.load(Ordering::Relaxed) != 0 {
-            s.position = (s.position.floor() + extra).min(if s.duration > 0.0 {
+            s.position = (s.position + extra).min(if s.duration > 0.0 {
                 s.duration
             } else {
                 f64::MAX
@@ -112,19 +121,15 @@ impl Player {
         }
     }
 
-    pub fn play_stream(&self, stream: Stream, start: f64) -> Result<()> {
-        if let Some(d) = stream.duration {
-            self.set_duration(d);
-        }
-        *self.current_stream.lock() = Some(stream.clone());
+    pub fn play_stream(&self, _stream: Stream, audio: Arc<Vec<u8>>, start: f64) -> Result<()> {
+        *self.current_audio.lock() = Some(audio.clone());
         self.samples.store(0, Ordering::Relaxed);
         {
             let mut s = self.state.lock();
             s.position = start;
-            s.loading = false;
         }
         self.tx
-            .send(Cmd::Play(stream, start))
+            .send(Cmd::Play(audio, start))
             .map_err(|_| anyhow!("audio thread died"))?;
         Ok(())
     }
@@ -315,9 +320,11 @@ pub enum NextChoice {
 fn audio_thread(
     rx: std::sync::mpsc::Receiver<Cmd>,
     samples: Arc<AtomicU64>,
+    sample_rate: Arc<AtomicU32>,
+    channels: Arc<AtomicU32>,
     ended: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
-    current_stream: Arc<Mutex<Option<Stream>>>,
+    current_audio: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
     state: Arc<Mutex<PlayerState>>,
 ) {
     let (_stream, handle) = match OutputStream::try_default() {
@@ -333,26 +340,25 @@ fn audio_thread(
     };
     let sink = Sink::try_new(&handle).expect("sink");
     sink.set_volume(state.lock().volume);
-    let mut active_start = 0.0f64;
 
     loop {
-        // Poll both commands and end-of-track.
         let cmd = rx.recv_timeout(Duration::from_millis(120));
         match cmd {
-            Ok(Cmd::Play(stream, start)) => {
+            Ok(Cmd::Play(audio, start)) => {
                 sink.stop();
-                match spawn_ffmpeg(&stream, start, samples.clone()) {
+                match make_source(audio, start, samples.clone()) {
                     Ok(src) => {
+                        sample_rate.store(src.sample_rate(), Ordering::Relaxed);
+                        channels.store(src.channels() as u32, Ordering::Relaxed);
                         samples.store(0, Ordering::SeqCst);
-                        active_start = start;
                         state.lock().position = start;
                         sink.append(src);
                         sink.play();
                         phase.store(1, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        eprintln!("ffmpeg: {e}");
-                        state.lock().error = Some(format!("Can't play this track"));
+                        eprintln!("decode: {e}");
+                        state.lock().error = Some("Can't play this track".into());
                         phase.store(0, Ordering::Relaxed);
                     }
                 }
@@ -373,20 +379,19 @@ fn audio_thread(
             }
             Ok(Cmd::Seek(secs)) => {
                 sink.stop();
-                let stream = current_stream.lock().clone();
-                if let Some(stream) = stream {
-                    match spawn_ffmpeg(&stream, secs, samples.clone()) {
+                let audio = current_audio.lock().clone();
+                if let Some(audio) = audio {
+                    match make_source(audio, secs, samples.clone()) {
                         Ok(src) => {
+                            sample_rate.store(src.sample_rate(), Ordering::Relaxed);
+                            channels.store(src.channels() as u32, Ordering::Relaxed);
                             samples.store(0, Ordering::SeqCst);
-                            active_start = secs;
                             state.lock().position = secs;
                             sink.append(src);
                             sink.play();
                             phase.store(1, Ordering::Relaxed);
                         }
-                        Err(e) => {
-                            eprintln!("seek: {e}");
-                        }
+                        Err(e) => eprintln!("seek: {e}"),
                     }
                 }
             }
@@ -394,146 +399,25 @@ fn audio_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let ph = phase.load(Ordering::Relaxed);
                 if ph == 1 && sink.empty() {
-                    // Source finished naturally.
                     phase.store(0, Ordering::Relaxed);
                     ended.store(true, Ordering::Relaxed);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        let _ = active_start;
     }
 }
 
-fn spawn_ffmpeg(stream: &Stream, start: f64, samples: Arc<AtomicU64>) -> Result<FfmpegSource> {
-    let ff = ffmpeg_bin().ok_or_else(|| anyhow!("ffmpeg not found on PATH"))?;
-    let mut cmd = Command::new(ff);
-    cmd.arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-reconnect")
-        .arg("1")
-        .arg("-reconnect_streamed")
-        .arg("1")
-        .arg("-reconnect_delay_max")
-        .arg("5")
-        .arg("-fflags")
-        .arg("+discardcorrupt");
-
-    if !stream.headers.is_empty() {
-        let mut h = String::new();
-        for (k, v) in &stream.headers {
-            h.push_str(k);
-            h.push_str(": ");
-            h.push_str(v);
-            h.push_str("\r\n");
-        }
-        cmd.arg("-headers").arg(h);
-    }
-
-    if start > 0.15 {
-        cmd.arg("-ss").arg(format!("{start:.3}"));
-    }
-    cmd.arg("-i")
-        .arg(&stream.url)
-        .arg("-vn")
-        .arg("-ac")
-        .arg("2")
-        .arg("-ar")
-        .arg("44100")
-        .arg("-f")
-        .arg("f32le")
-        .arg("-acodec")
-        .arg("pcm_f32le")
-        .arg("pipe:1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-
-    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn ffmpeg: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("ffmpeg stdout"))?;
-    Ok(FfmpegSource {
-        child,
-        stdout,
-        samples,
-        leftover: None,
-    })
+/// Decode a few samples so callers can verify the in-process pipeline
+/// without opening an audio device.
+pub fn decode_head(audio: &[u8], n: usize) -> Result<(u32, u16, usize)> {
+    crate::decode::decode_head(audio, n)
 }
 
-fn ffmpeg_bin() -> Option<&'static str> {
-    for p in ["ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-        if p.contains('/') {
-            if std::path::Path::new(p).exists() {
-                return Some(p);
-            }
-        } else if which(p) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn which(name: &str) -> bool {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            let p = std::path::Path::new(dir).join(name);
-            if p.is_file() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-struct FfmpegSource {
-    child: Child,
-    stdout: std::process::ChildStdout,
+fn make_source(
+    audio: Arc<Vec<u8>>,
+    start: f64,
     samples: Arc<AtomicU64>,
-    leftover: Option<f32>,
+) -> Result<crate::decode::AudioSource> {
+    crate::decode::open(audio, start, samples)
 }
-
-impl Drop for FfmpegSource {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Iterator for FfmpegSource {
-    type Item = f32;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(s) = self.leftover.take() {
-            return Some(s);
-        }
-        let mut buf = [0u8; 4];
-        match self.stdout.read_exact(&mut buf) {
-            Ok(()) => {
-                self.samples.fetch_add(1, Ordering::Relaxed);
-                Some(f32::from_le_bytes(buf))
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-impl Source for FfmpegSource {
-    fn current_frame_len(&self) -> Option<usize> {
-        None
-    }
-    fn channels(&self) -> u16 {
-        2
-    }
-    fn sample_rate(&self) -> u32 {
-        44100
-    }
-    fn total_duration(&self) -> Option<Duration> {
-        None
-    }
-}
-
-// Silence a warning if rodio's Sample/Item needs Result
-#[allow(dead_code)]
-fn _io(_: IoResult<()>) {}
