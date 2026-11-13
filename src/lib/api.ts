@@ -53,4 +53,6 @@ export const api = {
   signOut: () => invoke<void>('sign_out'),
   settings: () => invoke<Settings>('get_settings'),
   setSettings: (settings: Settings) => invoke<void>('set_settings', { settings }),
+  prefetch: (id: string) => { void invoke<void>('prefetch', { id }); },
+  cacheStats: () => invoke<[number, number]>('cache_stats'),
 };

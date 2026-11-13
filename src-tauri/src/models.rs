@@ -233,6 +233,15 @@ pub struct Settings {
     pub region: String,
     pub notifications: bool,
     pub autoplay: bool,
+    /// Disk cache cap for prefetched audio, in mebibytes. 0 disables it.
+    #[serde(default = "default_cache_mb")]
+    pub cache_max_mb: u64,
+    #[serde(default = "default_true")]
+    pub crossfade: bool,
+    #[serde(default = "default_xf_secs")]
+    pub crossfade_seconds: f64,
+    #[serde(default = "default_true")]
+    pub album_continuity: bool,
 }
 
 impl Default for Settings {
@@ -243,8 +252,22 @@ impl Default for Settings {
             region: "US".into(),
             notifications: true,
             autoplay: true,
+            cache_max_mb: default_cache_mb(),
+            crossfade: true,
+            crossfade_seconds: default_xf_secs(),
+            album_continuity: true,
         }
     }
+}
+
+fn default_cache_mb() -> u64 {
+    1024
+}
+fn default_true() -> bool {
+    true
+}
+fn default_xf_secs() -> f64 {
+    4.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,8 +1,10 @@
 mod auth;
+mod cache;
 mod color;
-mod decode;
+pub mod decode;
 mod innertube;
 mod login;
+mod mix;
 mod mpris;
 mod models;
 pub mod player;
@@ -23,7 +25,7 @@ use ytm::Ytm;
 use crate::auth::SessionStore;
 
 pub struct App {
-    ytm: Ytm,
+    ytm: std::sync::Arc<Ytm>,
     pub player: Player,
     http: reqwest::Client,
     store: SessionStore,
@@ -36,7 +38,7 @@ impl App {
     fn new() -> anyhow::Result<Self> {
         let store = SessionStore::new()?;
         let settings = load_settings(store.data_dir());
-        let ytm = Ytm::new()?;
+        let ytm = std::sync::Arc::new(Ytm::new()?);
         ytm.apply_settings(&settings);
         let mock = std::env::var("TARN_MOCK_AUTH").ok().as_deref() == Some("1");
         let auth = if mock {
@@ -53,9 +55,16 @@ impl App {
         } else {
             AuthStatus::default()
         };
+        let player = Player::start();
+        player.set_autoplay(settings.autoplay);
+        player.set_crossfade(
+            settings.crossfade,
+            settings.crossfade_seconds,
+            settings.album_continuity,
+        );
         Ok(Self {
             ytm,
-            player: Player::start(),
+            player,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(12))
                 .build()?,
@@ -239,9 +248,20 @@ async fn get_related(app: State<'_, Arc<App>>, id: String) -> Result<Related, St
 
 #[tauri::command]
 async fn start_radio(app: State<'_, Arc<App>>, id: String) -> Result<(), String> {
+    let snap = app.player.snapshot();
+    let seed = snap.track.clone().filter(|t| t.id == id);
     let tracks = app.ytm.radio(&id).await.map_err(|e| e.to_string())?;
+    let tracks = crate::ytm::seed_first(tracks, seed, &id);
     if tracks.is_empty() {
         return Err("No radio tracks".into());
+    }
+    // Already playing this seed: replace the queue without restarting.
+    if snap.track.as_ref().map(|t| t.id.as_str()) == Some(id.as_str())
+        && (snap.playing || snap.loading)
+    {
+        app.player.replace_queue(tracks.clone(), 0);
+        prefetch_ahead(&app, &tracks, 0);
+        return Ok(());
     }
     let t = tracks[0].clone();
     start_playback(&app, t, tracks, 0).await
@@ -254,6 +274,7 @@ async fn start_artist_radio(app: State<'_, Arc<App>>, radio_id: String) -> Resul
         .radio_id(&radio_id)
         .await
         .map_err(|e| e.to_string())?;
+    let tracks = crate::ytm::seed_first(tracks, None, "");
     if tracks.is_empty() {
         return Err("No radio tracks".into());
     }
@@ -271,7 +292,7 @@ async fn play(
     start_playback(&app, track, queue, index).await
 }
 
-async fn start_playback(
+pub(crate) async fn start_playback(
     app: &App,
     track: Track,
     queue: Vec<Track>,
@@ -279,21 +300,35 @@ async fn start_playback(
 ) -> Result<(), String> {
     let id = track.id.clone();
     let cover = track.cover.clone();
+    let snap = app.player.snapshot();
+    let style = if snap.playing && snap.track.is_some() {
+        if app.player.should_crossfade(snap.track.as_ref(), &track) {
+            crate::player::PlayStyle::Crossfade(app.player.crossfade_secs())
+        } else {
+            crate::player::PlayStyle::Cut
+        }
+    } else {
+        crate::player::PlayStyle::Fresh
+    };
     if let Some(d) = track.duration {
         app.player.set_duration(d as f64);
     }
     app.player.set_rating(false, false);
-    app.player.set_loading(track, queue, index);
+    app.player.set_loading(track, queue.clone(), index);
 
+    // Cover/accent is decorative — never block the play path on it.
     if let Some(url) = cover {
         let http = app.http.clone();
-        if let Ok(resp) = http.get(&url).send().await {
-            if let Ok(bytes) = resp.bytes().await {
-                if let Some(rgb) = color::accent_from_bytes(&bytes) {
-                    app.player.set_accent(Some(rgb));
+        let player = app.player.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(resp) = http.get(&url).send().await {
+                if let Ok(bytes) = resp.bytes().await {
+                    if let Some(rgb) = color::accent_from_bytes(&bytes) {
+                        player.set_accent(Some(rgb));
+                    }
                 }
             }
-        }
+        });
     }
 
     match app.ytm.stream(&id).await {
@@ -301,11 +336,15 @@ async fn start_playback(
             if let Some(d) = stream.duration {
                 app.player.set_duration(d);
             }
-            match app.ytm.fetch_audio(&stream).await {
-                Ok(audio) => app
-                    .player
-                    .play_stream(stream, audio, 0.0)
-                    .map_err(|e| e.to_string()),
+            match app.ytm.start_audio(&id, &stream).await {
+                Ok(audio) => {
+                    let r = app
+                        .player
+                        .play_stream(stream, audio, 0.0, style)
+                        .map_err(|e| e.to_string());
+                    prefetch_ahead(app, &queue, index);
+                    r
+                }
                 Err(e) => {
                     let msg = short_err(&e.to_string());
                     app.player.set_error(msg.clone());
@@ -319,6 +358,46 @@ async fn start_playback(
             Err(msg)
         }
     }
+}
+
+fn prefetch_ahead(app: &App, queue: &[Track], index: usize) {
+    let ids: Vec<String> = queue
+        .iter()
+        .skip(index + 1)
+        .take(3)
+        .map(|t| t.id.clone())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let remaining = queue.len().saturating_sub(index + 1);
+    let ytm = app.ytm.clone();
+    let player = app.player.clone();
+    tauri::async_runtime::spawn(async move {
+        for id in &ids {
+            ytm.prefetch(id).await;
+        }
+        if remaining < 3 {
+            if let Ok(more) = ytm.radio_continue().await {
+                if !more.is_empty() {
+                    player.append_unique(more.clone());
+                    for t in more.iter().take(3) {
+                        ytm.prefetch(&t.id).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn prefetch(app: State<'_, Arc<App>>, id: String) -> Result<(), String> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    let ytm = app.ytm.clone();
+    tauri::async_runtime::spawn(async move {
+        ytm.prefetch(&id).await;
+    });
+    Ok(())
 }
 
 fn short_err(s: &str) -> String {
@@ -382,16 +461,22 @@ fn queue_add(app: State<Arc<App>>, tracks: Vec<Track>, next: bool) {
     } else {
         app.player.append(tracks);
     }
+    let (q, i) = app.player.queue_and_index();
+    prefetch_ahead(&app, &q, i);
 }
 
 #[tauri::command]
 fn queue_remove(app: State<Arc<App>>, index: usize) {
     app.player.remove_at(index);
+    let (q, i) = app.player.queue_and_index();
+    prefetch_ahead(&app, &q, i);
 }
 
 #[tauri::command]
 fn queue_move(app: State<Arc<App>>, from: usize, to: usize) {
     app.player.move_item(from, to);
+    let (q, i) = app.player.queue_and_index();
+    prefetch_ahead(&app, &q, i);
 }
 
 #[tauri::command]
@@ -418,7 +503,7 @@ async fn prev(app: State<'_, Arc<App>>) -> Result<(), String> {
     }
 }
 
-async fn advance(app: &App, user: bool) -> Result<(), String> {
+pub(crate) async fn advance(app: &App, user: bool) -> Result<(), String> {
     match app.player.next_choice(user) {
         NextChoice::Play(i) => {
             let (queue, _) = app.player.queue_and_index();
@@ -434,27 +519,29 @@ async fn advance(app: &App, user: bool) -> Result<(), String> {
             let Some(id) = id else {
                 return Ok(());
             };
-            match app.ytm.radio(&id).await {
-                Ok(more) => {
-                    let existing: std::collections::HashSet<_> =
-                        queue.iter().map(|t| t.id.clone()).collect();
-                    for t in more {
-                        if !existing.contains(&t.id) {
-                            queue.push(t);
-                        }
+            let more = match app.ytm.radio_continue().await {
+                Ok(m) if !m.is_empty() => m,
+                _ => match app.ytm.radio(&id).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("autoplay radio: {e}");
+                        Vec::new()
                     }
-                    let i = index + 1;
-                    if i < queue.len() {
-                        let t = queue[i].clone();
-                        start_playback(app, t, queue, i).await
-                    } else {
-                        Ok(())
-                    }
+                },
+            };
+            let existing: std::collections::HashSet<_> =
+                queue.iter().map(|t| t.id.clone()).collect();
+            for t in more {
+                if !t.id.is_empty() && !existing.contains(&t.id) {
+                    queue.push(t);
                 }
-                Err(e) => {
-                    eprintln!("autoplay radio: {e}");
-                    Ok(())
-                }
+            }
+            let i = index + 1;
+            if i < queue.len() {
+                let t = queue[i].clone();
+                start_playback(app, t, queue, i).await
+            } else {
+                Ok(())
             }
         }
         NextChoice::SeekZero => {
@@ -618,8 +705,18 @@ fn set_settings(app: State<Arc<App>>, settings: Settings) {
     app.ytm.apply_settings(&settings);
     *app.notify.lock() = settings.notifications;
     app.player.set_autoplay(settings.autoplay);
+    app.player.set_crossfade(
+        settings.crossfade,
+        settings.crossfade_seconds,
+        settings.album_continuity,
+    );
     save_settings(app.store.data_dir(), &settings);
     *app.settings.lock() = settings;
+}
+
+#[tauri::command]
+fn cache_stats(app: State<Arc<App>>) -> (u64, u64) {
+    (app.ytm.cache.used_bytes(), app.ytm.cache.max_bytes())
 }
 
 #[tauri::command]
@@ -629,10 +726,69 @@ async fn extract_cookie_names(handle: AppHandle) -> Result<Vec<String>, String> 
         .map_err(|e| e.to_string())
 }
 
+
+fn main_hwnd(tauri_app: &tauri::App) -> crate::mpris::WindowHandle {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let Some(win) = tauri_app.get_webview_window("main") else {
+            eprintln!("media controls: no main window for HWND");
+            return None;
+        };
+        match win.hwnd() {
+            Ok(h) => Some(h.0 as usize),
+            Err(e) => {
+                eprintln!("media controls: hwnd: {e}");
+                None
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tauri_app;
+        None
+    }
+}
+
+
+fn maybe_blend(app: &Arc<App>) {
+    let Some((track, index, style)) = app.player.blend_due() else {
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let id = track.id.clone();
+        let result = async {
+            let stream = app.ytm.stream(&id).await.map_err(|e| e.to_string())?;
+            if let Some(d) = stream.duration {
+                app.player.set_duration(d);
+            }
+            let audio = app
+                .ytm
+                .start_audio(&id, &stream)
+                .await
+                .map_err(|e| e.to_string())?;
+            app.player
+                .play_stream(stream, audio, 0.0, style)
+                .map_err(|e| e.to_string())?;
+            app.player.adopt_track(track, index);
+            let (q, _) = app.player.queue_and_index();
+            prefetch_ahead(&app, &q, index);
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(e) = result {
+            eprintln!("blend: {e}");
+            app.player.clear_blending();
+        }
+    });
+}
+
 fn emit_loop(handle: AppHandle, app: Arc<App>) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            maybe_blend(&app);
             if app.player.take_ended() {
                 let app2 = app.clone();
                 let handle2 = handle.clone();
@@ -675,31 +831,8 @@ pub fn run() {
                 crate::ytdlp::maybe_update().await;
             });
             emit_loop(handle.clone(), app.clone());
-            mpris::start(app.clone(), handle.clone());
-            // Media keys from MPRIS come back as "media-cmd"
-            let app_cmd = app.clone();
-            handle.listen("media-cmd", move |ev| {
-                let p = ev.payload();
-                let app_cmd = app_cmd.clone();
-                if p.contains("next") {
-                    tauri::async_runtime::spawn(async move {
-                        let _ = advance(&app_cmd, true).await;
-                    });
-                } else if p.contains("prev") {
-                    tauri::async_runtime::spawn(async move {
-                        match app_cmd.player.prev_choice() {
-                            NextChoice::SeekZero => app_cmd.player.seek(0.0),
-                            NextChoice::Play(i) => {
-                                let (q, _) = app_cmd.player.queue_and_index();
-                                if let Some(t) = q.get(i).cloned() {
-                                    let _ = start_playback(&app_cmd, t, q, i).await;
-                                }
-                            }
-                            _ => {}
-                        }
-                    });
-                }
-            });
+            let hwnd = main_hwnd(tauri_app);
+            mpris::start(app.clone(), handle.clone(), hwnd);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -748,6 +881,8 @@ pub fn run() {
             get_settings,
             set_settings,
             extract_cookie_names,
+            prefetch,
+            cache_stats,
         ])
         .run(tauri::generate_context!())
         .expect("tarn failed to start");

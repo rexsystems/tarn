@@ -11,7 +11,33 @@ use anyhow::{anyhow, Context, Result};
 
 const UA: &str = "Tarn/0.1.0 (+https://github.com/rexsystems/tarn)";
 const RELEASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
-const CHECK_EVERY_SECS: u64 = 12 * 60 * 60;
+const CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
+
+/// Windows flag that prevents a console window from flashing when a
+/// console-subsystem sidecar (yt-dlp) is spawned. No-op on other OS.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Apply CREATE_NO_WINDOW and never attach a console stdin. Call this on
+/// every process we spawn — never run through a shell.
+pub fn silence_std(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(std::process::Stdio::null());
+}
+
+pub fn silence_tokio(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        // tokio::process::Command::creation_flags is an inherent method on
+        // Windows; the flag prevents a visible console for yt-dlp.exe.
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(std::process::Stdio::null());
+}
 
 pub fn data_bin_dir() -> PathBuf {
     dirs::data_dir()
@@ -273,9 +299,13 @@ pub async fn maybe_update() {
     if !ready || !is_usable(&dest) {
         return;
     }
-    match tokio::process::Command::new(&dest)
+    let mut upd = tokio::process::Command::new(&dest);
+    silence_tokio(&mut upd);
+    match upd
         .arg("-U")
         .arg("--no-warnings")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .output()
         .await
     {
@@ -295,8 +325,12 @@ pub async fn maybe_update() {
 }
 
 pub fn version(path: &Path) -> Option<String> {
-    let out = std::process::Command::new(path)
+    let mut cmd = std::process::Command::new(path);
+    silence_std(&mut cmd);
+    let out = cmd
         .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {

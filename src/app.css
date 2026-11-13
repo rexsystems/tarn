@@ -80,15 +80,38 @@ img {
   -webkit-user-drag: none;
 }
 
-::-webkit-scrollbar { width: 10px; height: 10px; }
+/* Overlay-style scrollbars: same look on WebKitGTK and Chromium/WebView2.
+   Thin rounded thumb, transparent track, brightens on hover. */
+html { color-scheme: dark; }
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+  background-color: transparent;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background-color: rgba(255, 255, 255, 0.16);
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 10px;
+  border-radius: 99px;
+  min-height: 28px;
+  min-width: 28px;
 }
-::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.2); background-clip: padding-box; }
-::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.34);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:active {
+  background-color: rgba(255, 255, 255, 0.46);
+  background-clip: padding-box;
+}
 
 ::selection { background: var(--accent-dim); color: var(--text); }
 
@@ -96,8 +119,9 @@ img {
 .app {
   display: grid;
   grid-template-columns: var(--side) 1fr;
-  grid-template-rows: 1fr var(--player);
+  grid-template-rows: var(--titlebar, 36px) 1fr var(--player);
   grid-template-areas:
+    'title title'
     'side main'
     'player player';
   height: 100%;
@@ -116,6 +140,12 @@ img {
   flex-direction: column;
   min-width: 0;
   overflow: hidden;
+  position: relative;
+  z-index: 2;
+}
+.sidebar.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .main {
@@ -1089,15 +1119,17 @@ img {
 
 /* ---------- now playing expanded ---------- */
 .np {
-  /* Explicit grid placement so this is not auto-placed into a new cell.
-     Only mounted when expanded. Covers the main+side area, player stays above. */
-  grid-area: side / side / main / main;
-  position: absolute;
-  inset: 0;
-  bottom: var(--player);
+  /* Span the full content row (sidebar + main). Do not use the old
+     named-line placement — it left the sidebar (Settings / Sign in)
+     painting on top of Now Playing. */
+  grid-column: 1 / -1;
+  grid-row: 2;
+  position: relative;
   z-index: 18;
   overflow: hidden;
   background: var(--bg);
+  min-width: 0;
+  min-height: 0;
 }
 .np-bg {
   position: absolute;
@@ -1253,3 +1285,192 @@ img {
 .q-item .tx { min-width: 0; flex: 1; }
 .q-item .tn { font-size: 14px; line-height: 18px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .q-item .ta { font-size: 12px; line-height: 16px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- custom title bar ---------- */
+.titlebar {
+  grid-area: title;
+  height: var(--titlebar, 36px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-side);
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  z-index: 40;
+  user-select: none;
+  -webkit-user-select: none;
+  flex-shrink: 0;
+}
+.titlebar .tb-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-2);
+  padding: 0 14px;
+  pointer-events: none;
+}
+.titlebar.mac .traffic-space { width: 78px; flex: 0 0 78px; height: 100%; }
+.titlebar.mac { justify-content: flex-start; gap: 8px; padding-left: 4px; }
+.titlebar.mac .tb-title { padding-left: 4px; }
+.tb-btns { display: flex; height: 100%; margin-left: auto; }
+.tb-btn {
+  width: 46px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-2);
+  border-radius: 0;
+}
+.tb-btn:hover { background: var(--bg-hover); color: var(--text); }
+.tb-btn.close:hover { background: #e81123; color: #fff; }
+.tb-btn svg { display: block; }
+
+/* ---------- dropdown ---------- */
+.dd { position: relative; min-width: 180px; }
+.dd-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  height: 40px;
+  padding: 0 12px;
+  background: #1c1b19;
+  color: var(--text);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  text-align: left;
+}
+.dd-btn:hover, .dd.open .dd-btn { border-color: rgba(var(--accent-rgb), 0.5); }
+.dd-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.dd-val { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-caret { color: var(--text-3); flex: 0 0 auto; transition: transform 160ms var(--ease); }
+.dd.open .dd-caret { transform: rotate(180deg); }
+.dd-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  min-width: 100%;
+  max-height: 280px;
+  overflow: auto;
+  background: #1c1b19;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: var(--shadow);
+  z-index: 60;
+  list-style: none;
+  animation: dd-in 140ms var(--ease);
+}
+.dd-menu.right { right: 0; }
+.dd-menu.left { left: 0; }
+@keyframes dd-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.dd-opt {
+  display: block;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--text);
+  text-align: left;
+}
+.dd-opt.act, .dd-opt:hover { background: var(--bg-hover); }
+.dd-opt.sel { color: var(--accent); }
+
+/* ---------- iOS-style toggle ---------- */
+.tog {
+  --tog-w: 51px;
+  --tog-h: 31px;
+  --tog-k: 27px;
+  width: var(--tog-w);
+  height: var(--tog-h);
+  border-radius: 999px;
+  background: #3a3936;
+  position: relative;
+  flex: 0 0 var(--tog-w);
+  transition: background 200ms var(--ease);
+}
+.tog.on { background: var(--accent); }
+.tog:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.tog:disabled { opacity: 0.45; }
+.tog-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: var(--tog-k);
+  height: var(--tog-k);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  transition: transform 220ms var(--ease);
+}
+.tog.on .tog-knob { transform: translateX(20px); }
+
+/* ---------- custom checkbox ---------- */
+.chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 20px;
+}
+.chk-box {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: 1.5px solid var(--line-2);
+  background: #1c1b19;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: transparent;
+  transition: background 160ms var(--ease), border-color 160ms, color 160ms;
+}
+.chk.on .chk-box {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a1208;
+}
+.chk:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+
+/* ---------- skeleton / shimmer ---------- */
+@keyframes shimmer {
+  0% { background-position: -600px 0; }
+  100% { background-position: 600px 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, #181715 20%, #2a2926 45%, #181715 70%);
+  background-size: 1200px 100%;
+  animation: shimmer 1.5s infinite linear;
+  border-radius: 8px;
+}
+.skel { padding: 8px 0 32px; }
+.skel-chips, .skel-tabs { display: flex; gap: 10px; margin-bottom: 28px; overflow: hidden; }
+.skel-chip { height: 36px; width: 92px; border-radius: 18px; flex: 0 0 92px; }
+.skel-title { height: 22px; width: 220px; margin: 8px 0 16px; }
+.skel-h1 { height: 36px; width: min(420px, 70%); margin-bottom: 16px; border-radius: 10px; }
+.skel-row { display: flex; gap: 16px; overflow: hidden; margin-bottom: 36px; }
+.skel-card { flex: 0 0 152px; }
+.skel-cover { width: 152px; height: 152px; border-radius: 10px; margin-bottom: 10px; }
+.skel-cover.lg { width: 200px; height: 200px; flex: 0 0 200px; margin: 0; }
+.skel-ln { height: 13px; width: 100%; margin-top: 6px; }
+.skel-ln.short { width: 62%; }
+.skel-search { height: 44px; max-width: 560px; border-radius: 22px; margin: 8px 0 20px; }
+.skel-track { display: flex; align-items: center; gap: 12px; min-height: 52px; }
+.skel-sq { width: 40px; height: 40px; border-radius: 6px; flex: 0 0 40px; }
+.skel-tmeta { flex: 1; min-width: 0; max-width: 320px; }
+.skel-hero { display: flex; align-items: flex-end; gap: 24px; margin: 16px 0 32px; }
+.skel-avatar { width: 200px; height: 200px; border-radius: 100px; flex: 0 0 200px; }
+.skel-hmeta { flex: 1; min-width: 0; padding-bottom: 8px; }
+.skel-acts { display: flex; gap: 10px; margin-top: 18px; }
+.skel-btn { height: 40px; width: 108px; border-radius: 20px; }

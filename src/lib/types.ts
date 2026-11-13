@@ -180,6 +180,10 @@ export interface Settings {
   region: string;
   notifications: boolean;
   autoplay: boolean;
+  cache_max_mb: number;
+  crossfade: boolean;
+  crossfade_seconds: number;
+  album_continuity: boolean;
 }
 
 export interface PlayerState {

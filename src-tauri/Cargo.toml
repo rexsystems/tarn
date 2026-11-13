@@ -42,6 +42,7 @@ hex = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 souvlaki = "0.7"
+global-hotkey = "0.7"
 notify-rust = "4"
 
 

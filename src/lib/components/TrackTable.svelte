@@ -4,6 +4,7 @@
   import Cover from './Cover.svelte';
   import Hi from './Hi.svelte';
   import { MoreHorizontalIcon, PlayIcon } from '../icons';
+  import { api } from '../api';
 
   let {
     tracks,
@@ -50,6 +51,7 @@
         class="trow {t.id === currentId ? 'on' : ''}"
         ondblclick={() => onPlay(t, i)}
         oncontextmenu={(e) => onContext(e, t, i)}
+        onmouseenter={() => t.id && api.prefetch(t.id)}
       >
         {#if numbered}
           <td class="idx">

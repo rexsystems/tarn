@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use rustypipe::client::RustyPipe;
+use rustypipe::client::{ClientType, RustyPipe};
 use rustypipe::model::{
     AlbumItem, AlbumType, ArtistItem, AudioCodec, AudioFormat, MusicItem, MusicPlaylistItem,
     Thumbnail, TrackItem, TrackType,
@@ -21,6 +21,13 @@ use crate::models::{
     Lyrics, PlaylistCard, Related, SearchResults, Settings, Shelf, ShelfItem, Track,
 };
 
+const STREAM_TTL: Duration = Duration::from_secs(5 * 60 * 60);
+
+struct CachedStream {
+    stream: Stream,
+    at: Instant,
+}
+
 pub struct Ytm {
     rp: RustyPipe,
     http: reqwest::Client,
@@ -29,6 +36,10 @@ pub struct Ytm {
     quality: Mutex<String>,
     cookie: Mutex<Option<String>>,
     cookies_file: PathBuf,
+    streams: Mutex<std::collections::HashMap<String, CachedStream>>,
+    bodies: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::decode::GrowingBody>>>,
+    pub cache: std::sync::Arc<crate::cache::AudioCache>,
+    radio: Mutex<Option<rustypipe::model::paginator::Paginator<TrackItem>>>,
 }
 
 impl Ytm {
@@ -57,6 +68,10 @@ impl Ytm {
             quality: Mutex::new("high".into()),
             cookie: Mutex::new(None),
             cookies_file,
+            streams: Mutex::new(std::collections::HashMap::new()),
+            bodies: Mutex::new(std::collections::HashMap::new()),
+            cache: std::sync::Arc::new(crate::cache::AudioCache::open()),
+            radio: Mutex::new(None),
         })
     }
 
@@ -64,6 +79,7 @@ impl Ytm {
         *self.lang.lock().unwrap() = s.language.clone();
         *self.country.lock().unwrap() = s.region.clone();
         *self.quality.lock().unwrap() = s.quality.clone();
+        self.cache.set_max_mb(s.cache_max_mb);
     }
 
     pub fn cookies_file(&self) -> &PathBuf {
@@ -717,13 +733,45 @@ impl Ytm {
     }
 
     pub async fn radio(&self, video_id: &str) -> Result<Vec<Track>> {
-        let r = self
-            .rp
-            .query()
-            .music_radio_track(video_id)
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok(r.items.iter().map(track_from).collect())
+        let r = match self.rp.query().music_radio_track(video_id).await {
+            Ok(r) if !r.items.is_empty() => r,
+            other => {
+                if let Err(e) = &other {
+                    eprintln!("music_radio_track: {e}");
+                }
+                self.rp
+                    .query()
+                    .music_radio(&format!("RDAMVM{video_id}"))
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?
+            }
+        };
+        let tracks = dedup_tracks(r.items.iter().map(track_from).collect());
+        *self.radio.lock().unwrap() = Some(r);
+        Ok(tracks)
+    }
+
+    /// Next page of the current radio, unique tracks only.
+    pub async fn radio_continue(&self) -> Result<Vec<Track>> {
+        let page = self.radio.lock().unwrap().clone();
+        let Some(p) = page else {
+            return Ok(Vec::new());
+        };
+        if p.is_exhausted() {
+            return Ok(Vec::new());
+        }
+        match p.next(&self.rp.query()).await {
+            Ok(Some(n)) => {
+                let tracks = dedup_tracks(n.items.iter().map(track_from).collect());
+                *self.radio.lock().unwrap() = Some(n);
+                Ok(tracks)
+            }
+            Ok(None) => {
+                *self.radio.lock().unwrap() = None;
+                Ok(Vec::new())
+            }
+            Err(e) => Err(anyhow!("{e}")),
+        }
     }
 
     pub async fn radio_playlist(&self, playlist_id: &str) -> Result<Vec<Track>> {
@@ -784,8 +832,8 @@ impl Ytm {
             .await
             .map_err(|e| anyhow!("{e}"))?;
         Ok(Related {
-            tracks: r.tracks.iter().map(track_from).collect(),
-            versions: r.other_versions.iter().map(track_from).collect(),
+            tracks: dedup_tracks(r.tracks.iter().map(track_from).collect()),
+            versions: dedup_tracks(r.other_versions.iter().map(track_from).collect()),
             albums: r.albums.iter().map(album_from).collect(),
             artists: r.artists.iter().map(artist_from).collect(),
             playlists: r.playlists.iter().map(playlist_from).collect(),
@@ -881,12 +929,49 @@ impl Ytm {
 
     /// Resolve a playable audio stream URL.
     ///
-    /// On desktop, the bundled (or auto-updated) yt-dlp sidecar is tried first
-    /// because it stays current with YouTube's player changes. rustypipe is the
-    /// fallback, and the only path on Android/iOS (where we cannot run a sidecar).
-    /// rustypipe-botguard is a separate browser-simulation CLI, not an in-process
-    /// crate, so it is not bundled; rustypipe's iOS/TV clients work without PO tokens.
+    /// rustypipe (iOS/TV clients, no PO token) is tried first so play can
+    /// start in-process without spawning yt-dlp. The sidecar is only used
+    /// if rustypipe fails, and never on Android/iOS. Resolved URLs are
+    /// cached for a few hours (YouTube's googlevideo links last ~6 h).
     pub async fn stream(&self, video_id: &str) -> Result<Stream> {
+        if let Some(s) = self.cached_stream(video_id) {
+            return Ok(s);
+        }
+        let s = self.resolve_stream(video_id).await?;
+        self.put_stream(video_id, s.clone());
+        Ok(s)
+    }
+
+    fn cached_stream(&self, id: &str) -> Option<Stream> {
+        let mut g = self.streams.lock().unwrap();
+        if let Some(c) = g.get(id) {
+            if c.at.elapsed() < STREAM_TTL {
+                return Some(c.stream.clone());
+            }
+        }
+        g.remove(id);
+        None
+    }
+
+    fn put_stream(&self, id: &str, stream: Stream) {
+        self.streams.lock().unwrap().insert(
+            id.to_string(),
+            CachedStream {
+                stream,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    fn evict_stream(&self, id: &str) {
+        self.streams.lock().unwrap().remove(id);
+    }
+
+    async fn resolve_stream(&self, video_id: &str) -> Result<Stream> {
+        match rustypipe_stream(&self.rp, video_id).await {
+            Ok(s) => return Ok(s),
+            Err(e) => eprintln!("rustypipe stream: {e}"),
+        }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let cookies = if self.cookies_file.exists() {
@@ -895,52 +980,138 @@ impl Ytm {
                 None
             };
             let q = self.quality();
-            match ytdlp_stream(video_id, cookies.as_deref(), &q).await {
-                Ok(s) => return Ok(s),
-                Err(e) => eprintln!("yt-dlp stream: {e}"),
-            }
+            return ytdlp_stream(video_id, cookies.as_deref(), &q).await;
         }
-        rustypipe_stream(&self.rp, video_id).await
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            Err(anyhow!("no playable stream"))
+        }
     }
 
-    /// Download the full audio payload so the player can decode and seek
-    /// in-process (no ffmpeg).
-    pub async fn fetch_audio(&self, stream: &Stream) -> Result<std::sync::Arc<Vec<u8>>> {
-        // A dedicated client: googlevideo often stalls on HTTP/2 and throttles
-        // hard unless a Range request is used (HTTP 206).
-        let client = reqwest::Client::builder()
-            .user_agent(user_agent())
-            .http1_only()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .timeout(Duration::from_secs(90))
-            .build()?;
-        let mut req = client.get(&stream.url);
-        let mut has_range = false;
-        for (k, v) in &stream.headers {
-            if k.eq_ignore_ascii_case("range") {
-                has_range = true;
+    /// Start a progressive download and return once enough of the file is
+    /// present to probe and begin decoding (see `READY_BYTES`). The rest
+    /// continues in the background.
+    pub async fn start_audio(
+        &self,
+        video_id: &str,
+        stream: &Stream,
+    ) -> Result<std::sync::Arc<crate::decode::GrowingBody>> {
+        if !video_id.is_empty() {
+            if let Some(bytes) = self.cache.read_complete(video_id) {
+                let body = crate::decode::GrowingBody::from_complete(bytes);
+                self.bodies
+                    .lock()
+                    .unwrap()
+                    .insert(stream.url.clone(), body.clone());
+                return Ok(body);
             }
-            req = req.header(k.as_str(), v.as_str());
         }
-        if !has_range {
-            req = req.header("Range", "bytes=0-");
+        if let Some(existing) = self.existing_body(&stream.url) {
+            existing.wait_ready().await?;
+            return Ok(existing);
         }
-        let resp = req.send().await.context("audio download")?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(anyhow!("audio download: HTTP {status}"));
+        let body = self.spawn_download(video_id, stream);
+        match body.wait_ready().await {
+            Ok(()) => Ok(body),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("403") {
+                    self.evict_stream(video_id);
+                    self.bodies.lock().unwrap().remove(&stream.url);
+                    let stream = self.resolve_stream(video_id).await?;
+                    self.put_stream(video_id, stream.clone());
+                    let body = self.spawn_download(video_id, &stream);
+                    body.wait_ready().await?;
+                    return Ok(body);
+                }
+                Err(e)
+            }
         }
-        let bytes = resp.bytes().await.context("audio body")?;
-        if bytes.len() < 64 {
-            return Err(anyhow!("audio download too small ({} bytes)", bytes.len()));
+    }
+
+    fn existing_body(
+        &self,
+        url: &str,
+    ) -> Option<std::sync::Arc<crate::decode::GrowingBody>> {
+        let b = self.bodies.lock().unwrap().get(url).cloned()?;
+        if b.error().is_some() {
+            return None;
         }
-        eprintln!(
-            "audio: {} bytes from {} ({})",
-            bytes.len(),
-            stream.source,
-            stream.mime.as_deref().unwrap_or("?")
-        );
-        Ok(std::sync::Arc::new(bytes.to_vec()))
+        Some(b)
+    }
+
+    fn spawn_download(
+        &self,
+        video_id: &str,
+        stream: &Stream,
+    ) -> std::sync::Arc<crate::decode::GrowingBody> {
+        if let Some(existing) = self.existing_body(&stream.url) {
+            return existing;
+        }
+        let body = crate::decode::GrowingBody::new();
+        // Resume from a partial on-disk download if we have one.
+        if !video_id.is_empty() {
+            if let Some((path, _)) = self.cache.partial(video_id) {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    body.append(&bytes);
+                }
+            }
+        }
+        {
+            let mut g = self.bodies.lock().unwrap();
+            g.insert(stream.url.clone(), body.clone());
+            if g.len() > 10 {
+                let stale: Vec<String> = g
+                    .iter()
+                    .filter(|(_, b)| b.is_done())
+                    .map(|(k, _)| k.clone())
+                    .take(g.len() - 8)
+                    .collect();
+                for k in stale {
+                    g.remove(&k);
+                }
+            }
+        }
+        let stream = stream.clone();
+        let body2 = body.clone();
+        let cache = self.cache.clone();
+        let id = video_id.to_string();
+        tokio::spawn(async move {
+            let c = if id.is_empty() {
+                None
+            } else {
+                Some((cache, id))
+            };
+            if let Err(e) = download_into(&stream, &body2, c).await {
+                body2.fail(e.to_string());
+            } else {
+                body2.finish();
+            }
+        });
+        body
+    }
+
+    /// Resolve the stream and fully download it into the disk cache.
+    pub async fn prefetch(&self, video_id: &str) {
+        if self.cache.has_complete(video_id) {
+            return;
+        }
+        let Ok(stream) = self.stream(video_id).await else {
+            return;
+        };
+        if let Some(existing) = self.existing_body(&stream.url) {
+            let _ = existing.wait_done().await;
+            return;
+        }
+        let body = self.spawn_download(video_id, &stream);
+        let _ = body.wait_done().await;
+    }
+
+    /// Wait for a complete download (diagnostics).
+    pub async fn fetch_audio(&self, stream: &Stream) -> Result<std::sync::Arc<Vec<u8>>> {
+        let body = self.start_audio("", stream).await?;
+        body.wait_done().await?;
+        Ok(std::sync::Arc::new(body.snapshot()))
     }
 }
 
@@ -1163,8 +1334,137 @@ fn normalize_duration(d: u32) -> u32 {
     }
 }
 
+fn dedup_tracks(tracks: Vec<Track>) -> Vec<Track> {
+    let mut seen = std::collections::HashSet::new();
+    tracks
+        .into_iter()
+        .filter(|t| !t.id.is_empty() && seen.insert(t.id.clone()))
+        .collect()
+}
+
+pub fn seed_first(mut tracks: Vec<Track>, seed: Option<Track>, id: &str) -> Vec<Track> {
+    tracks = dedup_tracks(tracks);
+    if let Some(pos) = tracks.iter().position(|t| t.id == id) {
+        if pos != 0 {
+            let t = tracks.remove(pos);
+            tracks.insert(0, t);
+        }
+    } else if let Some(s) = seed {
+        if s.id == id {
+            tracks.insert(0, s);
+        }
+    }
+    tracks
+}
+
+async fn download_into(
+    stream: &Stream,
+    body: &crate::decode::GrowingBody,
+    cache: Option<(std::sync::Arc<crate::cache::AudioCache>, String)>,
+) -> Result<()> {
+    let mut last_err = None;
+    for attempt in 0..6u32 {
+        let offset = body.len() as u64;
+        if let Some((cache, id)) = &cache {
+            let _ = cache.write_part(id, &body.snapshot());
+        }
+        match download_range(stream, body, offset, cache.as_ref()).await {
+            Ok(()) => {
+                if let Some((cache, id)) = &cache {
+                    if let Err(e) = cache.commit(id, &body.snapshot()) {
+                        eprintln!("cache commit: {e}");
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                let wait = Duration::from_millis(400 * (1u64 << attempt.min(4)));
+                eprintln!(
+                    "audio download retry {}: {}; backing off {wait:?}",
+                    attempt + 1,
+                    last_err.as_ref().unwrap()
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("audio download failed")))
+}
+
+async fn download_range(
+    stream: &Stream,
+    body: &crate::decode::GrowingBody,
+    offset: u64,
+    cache: Option<&(std::sync::Arc<crate::cache::AudioCache>, String)>,
+) -> Result<()> {
+    // googlevideo stalls on HTTP/2 and throttles without a Range request.
+    let client = reqwest::Client::builder()
+        .user_agent(user_agent())
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build()?;
+    let mut req = client.get(&stream.url);
+    for (k, v) in &stream.headers {
+        if k.eq_ignore_ascii_case("range") {
+            continue;
+        }
+        req = req.header(k.as_str(), v.as_str());
+    }
+    req = req.header("Range", format!("bytes={offset}-"));
+    let resp = req.send().await.context("audio download")?;
+    let status = resp.status();
+    if status.as_u16() == 416 {
+        // Already have the whole file.
+        if body.len() >= 64 {
+            return Ok(());
+        }
+        return Err(anyhow!("audio download: HTTP 416"));
+    }
+    if !status.is_success() {
+        return Err(anyhow!("audio download: HTTP {status}"));
+    }
+    if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
+        if let Ok(s) = cr.to_str() {
+            if let Some(total) = s.rsplit('/').next() {
+                if let Ok(n) = total.parse::<u64>() {
+                    body.set_content_len(n);
+                }
+            }
+        }
+    } else if let Some(len) = resp.content_length() {
+        body.set_content_len(len.saturating_add(offset));
+    }
+    let mut resp = resp;
+    let mut n = 0usize;
+    while let Some(chunk) = resp.chunk().await.context("audio body")? {
+        n += chunk.len();
+        body.append(&chunk);
+        if let Some((cache, id)) = cache {
+            let _ = cache.append_part(id, &chunk);
+        }
+    }
+    if body.len() < 64 {
+        return Err(anyhow!("audio download too small ({} bytes)", body.len()));
+    }
+    eprintln!(
+        "audio: +{n} bytes (total {}) from {} ({})",
+        body.len(),
+        stream.source,
+        stream.mime.as_deref().unwrap_or("?")
+    );
+    Ok(())
+}
+
 async fn rustypipe_stream(rp: &RustyPipe, id: &str) -> Result<Stream> {
-    let player = rp.query().player(id).await.map_err(|e| anyhow!("{e}"))?;
+    // iOS and TV clients return unobfuscated URLs and do not need a PO token.
+    let player = rp
+        .query()
+        .player_from_clients(id, &[ClientType::Ios, ClientType::Tv])
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
     let stream = pick_audio(&player.audio_streams).ok_or_else(|| {
         anyhow!(
             "no audio streams (client={:?}, videos={})",
@@ -1220,6 +1520,7 @@ async fn ytdlp_stream(
         .context("yt-dlp sidecar is not available")?;
     let url = format!("https://www.youtube.com/watch?v={id}");
     let mut cmd = Command::new(&bin);
+    crate::ytdlp::silence_tokio(&mut cmd);
     cmd.arg("--no-warnings").arg("--no-playlist").arg("-f").arg(format_for(quality));
     if let Some(p) = cookies {
         cmd.arg("--cookies").arg(p);
@@ -1276,8 +1577,12 @@ async fn search_ytdlp(query: &str) -> Result<Vec<Track>> {
         .await
         .context("yt-dlp sidecar is not available")?;
     let q = format!("ytsearch12:{query}");
-    let out = Command::new(&bin)
+    let mut cmd = Command::new(&bin);
+    crate::ytdlp::silence_tokio(&mut cmd);
+    let out = cmd
         .args(["--no-warnings", "--flat-playlist", "-j", "--", &q])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
         .await
         .with_context(|| format!("run yt-dlp at {}", bin.display()))?;

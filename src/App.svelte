@@ -16,6 +16,10 @@
   import TrackTable from './lib/components/TrackTable.svelte';
   import ContextMenu from './lib/components/ContextMenu.svelte';
   import Slider from './lib/components/Slider.svelte';
+  import TitleBar from './lib/components/TitleBar.svelte';
+  import Dropdown from './lib/components/Dropdown.svelte';
+  import Toggle from './lib/components/Toggle.svelte';
+  import Skeleton from './lib/components/Skeleton.svelte';
   import {
     Home01Icon, Search01Icon, Compass01Icon, LibraryIcon, Settings02Icon,
     PlayIcon, PauseIcon, PreviousIcon, NextIcon, ShuffleIcon, RepeatIcon, RepeatOne01Icon,
@@ -41,7 +45,7 @@
   let library = $state<Library | null>(null);
   let history = $state<Track[] | null>(null);
   let auth = $state<AuthStatus>({ signed_in: false, mock: false, account: null, store: null });
-  let settings = $state<SettingsT>({ quality: 'high', language: 'en', region: 'US', notifications: true, autoplay: true });
+  let settings = $state<SettingsT>({ quality: 'high', language: 'en', region: 'US', notifications: true, autoplay: true, cache_max_mb: 1024, crossfade: true, crossfade_seconds: 4, album_continuity: true });
   let player = $state<PlayerState>({
     track: null, playing: false, loading: false, position: 0, duration: 0,
     volume: 0.85, queue: [], index: 0, error: null, accent: null,
@@ -57,6 +61,25 @@
   let related = $state<Related | null>(null);
   let ctx = $state<CtxTarget | null>(null);
   let addTitle = $state('');
+  let cacheUsed = $state(0);
+  let cacheMax = $state(1024 * 1024 * 1024);
+
+  const HOME_KEY = 'tarn.home.v1';
+  function readHomeCache(): Home | null {
+    try {
+      const raw = localStorage.getItem(HOME_KEY);
+      if (!raw) return null;
+      const v = JSON.parse(raw);
+      return (v && v.home) ? v.home as Home : v as Home;
+    } catch { return null; }
+  }
+  function writeHomeCache(h: Home) {
+    try { localStorage.setItem(HOME_KEY, JSON.stringify({ at: Date.now(), home: h })); } catch {}
+  }
+  function dedupeTracks(list: Track[]): Track[] {
+    const seen = new Set<string>();
+    return list.filter((t) => t.id && !seen.has(t.id) && (seen.add(t.id), true));
+  }
 
   $effect(() => {
     if (player.accent) {
@@ -70,6 +93,7 @@
   onMount(() => {
     const unsubs: Array<() => void> = [];
     (async () => {
+      home = readHomeCache();
       try {
         player = await api.state();
         auth = await api.auth();
@@ -149,11 +173,14 @@
   }
 
   async function loadHome(params?: string | null) {
-    loading = true;
+    const quiet = !params && !!home;
+    if (!quiet) loading = true;
     try {
-      home = await api.home(params);
+      const h = await api.home(params);
+      home = h;
+      if (!params) writeHomeCache(h);
     } catch (e) {
-      err = String(e);
+      if (!home) err = String(e);
     } finally {
       loading = false;
     }
@@ -220,6 +247,12 @@
     try { await api.play(t, tracks, index); } catch (e) { err = String(e); }
   }
   function playOne(t: Track) { playTracks([t, ...player.queue.filter((x) => x.id !== t.id)], 0); }
+
+  async function startRadio(id?: string) {
+    const vid = id || player.track?.id;
+    if (!vid) return;
+    try { await api.radio(vid); } catch (e) { err = String(e); }
+  }
 
   function shuffled<T>(xs: T[]): T[] {
     const a = xs.slice();
@@ -321,22 +354,32 @@
 
   async function openPanel(tab: 'queue' | 'lyrics' | 'related') {
     panel = panel === tab ? null : tab;
-    const id = player.track?.id;
-    if (tab === 'lyrics' && id) {
-      try { lyrics = await api.lyrics(id); } catch { lyrics = { source: null, lines: [], synced: false }; }
-    }
-    if (tab === 'related' && id) {
-      try { related = await api.related(id); } catch { related = null; }
-    }
   }
 
+  // Fetch lyrics/related once per track. A plain (non-reactive) last-id
+  // is required: the player snapshot is replaced every 200 ms and a
+  // naive $effect would refetch in a loop.
+  let relatedFor = '';
+  let lyricsFor = '';
   $effect(() => {
-    const id = player.track?.id;
-    if (panel === 'lyrics' && id) {
-      api.lyrics(id).then((l) => (lyrics = l)).catch(() => {});
+    const id = player.track?.id ?? '';
+    const p = panel;
+    if (p === 'related' && id && relatedFor !== id) {
+      relatedFor = id;
+      const req = id;
+      api.related(id).then((r) => {
+        if (relatedFor !== req) return;
+        related = { ...r, tracks: dedupeTracks(r.tracks), versions: dedupeTracks(r.versions || []) };
+      }).catch(() => {
+        if (relatedFor === req) related = { tracks: [], versions: [], albums: [], artists: [], playlists: [] };
+      });
     }
-    if (panel === 'related' && id) {
-      api.related(id).then((r) => (related = r)).catch(() => {});
+    if (p === 'lyrics' && id && lyricsFor !== id) {
+      lyricsFor = id;
+      const req = id;
+      api.lyrics(id).then((l) => { if (lyricsFor === req) lyrics = l; }).catch(() => {
+        if (lyricsFor === req) lyrics = { source: null, lines: [], synced: false };
+      });
     }
   });
 
@@ -398,11 +441,29 @@
     }
   });
 
+  function fmtCache(n: number) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(n >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+  async function refreshCacheStats() {
+    try {
+      const [used, max] = await api.cacheStats();
+      cacheUsed = used;
+      cacheMax = max;
+    } catch {}
+  }
+  $effect(() => {
+    if (view.id === 'settings') refreshCacheStats();
+  });
+
   let navOn = (id: string) => view.id === id;
 </script>
 
-<div class="app" style="--player: 112px; --side: 248px;">
-  <aside class="sidebar">
+<div class="app" style="--player: 112px; --side: 248px; --titlebar: 36px;">
+  <TitleBar />
+  <aside class="sidebar" class:is-hidden={expanded}>
     <div class="brand">
       <img src="/logo.png" width="44" height="44" alt="" />
       <span class="word">Tarn</span>
@@ -472,7 +533,7 @@
             {/each}
           </div>
         {/if}
-        {#if loading && !home}<div class="spin" style="margin:40px auto"></div>{/if}
+        {#if loading && !home}<Skeleton kind="home" />{/if}
         {#each home?.shelves ?? [] as s}
           <ShelfRow shelf={s} onPlayItems={playTracks} onOpen={openItem} onContext={contextItem} />
         {/each}
@@ -484,7 +545,7 @@
           <button type="button" onclick={() => go({ id: 'charts' })}><Hi icon={MusicNote01Icon} size={24} /> Charts</button>
           <button type="button" onclick={() => document.getElementById('moods')?.scrollIntoView({ behavior: 'smooth' })}><Hi icon={Compass01Icon} size={24} /> Moods & genres</button>
         </div>
-        {#if loading && !explore}<div class="spin" style="margin:40px auto"></div>{/if}
+        {#if loading && !explore}<Skeleton kind="explore" />{/if}
         {#each (explore?.shelves ?? []).filter((s) => s.kind !== 'moods' && !s.title.toLowerCase().includes('mood')) as s}
           <ShelfRow shelf={s} onPlayItems={playTracks} onOpen={openItem} onContext={contextItem} />
         {/each}
@@ -501,6 +562,7 @@
 
       {:else if view.id === 'charts' || view.id === 'new-releases'}
         <h1 class="page-title">{view.id === 'charts' ? 'Charts' : 'New releases'}</h1>
+        {#if loading && !(view.id === 'charts' ? charts : releases)}<Skeleton kind="home" />{/if}
         {#each (view.id === 'charts' ? charts : releases)?.shelves ?? [] as s}
           <ShelfRow shelf={s} onPlayItems={playTracks} onOpen={openItem} onContext={contextItem} />
         {/each}
@@ -527,6 +589,7 @@
             {/if}
           </div>
         </div>
+        {#if loading && !results}<Skeleton kind="search" />{/if}
         {#if results}
           <div class="tabs">
             {#each [
@@ -561,7 +624,7 @@
                   {#if top.kind === 'track' || top.kind === 'video'}
                     <button class="btn" type="button" onclick={(e) => { e.stopPropagation(); playOne(itemToTrack(top)); }}><Hi icon={PlayIcon} size={18} /> Play</button>
                     <button class="btn ghost" type="button" onclick={(e) => { e.stopPropagation(); playTopShuffled(top); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
-                    <button class="btn ghost" type="button" onclick={(e) => { e.stopPropagation(); api.radio(top.id); }}><Hi icon={Radio02Icon} size={18} /> Radio</button>
+                    <button class="btn ghost" type="button" onclick={(e) => { e.stopPropagation(); startRadio(top.id); }}><Hi icon={Radio02Icon} size={18} /> Radio</button>
                   {:else}
                     <button class="btn" type="button" onclick={(e) => { e.stopPropagation(); playCollection(top, false); }}><Hi icon={PlayIcon} size={18} /> Play</button>
                     <button class="btn ghost" type="button" onclick={(e) => { e.stopPropagation(); playCollection(top, true); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
@@ -702,7 +765,9 @@
             onContext={(e, t) => contextTrack(e, t)} />
         {/if}
 
-      {:else if view.id === 'artist' && artist}
+      {:else if view.id === 'artist'}
+        {#if loading && !artist}<Skeleton kind="artist" />{/if}
+        {#if artist}
         <div class="hero" style="min-height:320px">
           {#if artist.header}
             <Cover src={artist.header} banner width={1240} height={320} class="hero-bg" alt="" />
@@ -794,7 +859,10 @@
           </div>
         {/if}
 
-      {:else if (view.id === 'album' || view.id === 'playlist') && collection}
+        {/if}
+      {:else if view.id === 'album' || view.id === 'playlist'}
+        {#if loading && !collection}<Skeleton kind="album" />{/if}
+        {#if collection}
         <div class="hero" style="min-height:260px;background:var(--bg-elev)">
           <div class="hero-shade"></div>
           <div class="hero-in">
@@ -810,7 +878,7 @@
               <div class="hero-acts">
                 <button class="btn" type="button" onclick={() => playTracks(collection!.tracks, 0)}><Hi icon={PlayIcon} size={18} /> Play</button>
                 <button class="btn ghost" type="button" onclick={() => { api.setShuffle(true); playTracks([...collection!.tracks].sort(() => Math.random() - 0.5), 0); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
-                <button class="btn ghost" type="button" onclick={() => collection!.tracks[0] && api.radio(collection!.tracks[0].id)}><Hi icon={Radio02Icon} size={18} /> Radio</button>
+                <button class="btn ghost" type="button" onclick={() => collection!.tracks[0] && startRadio(collection!.tracks[0].id)}><Hi icon={Radio02Icon} size={18} /> Radio</button>
                 {#if auth.signed_in}
                   <button class="btn ghost {collection.saved ? 'on' : ''}" type="button" onclick={async () => { const s = !collection!.saved; try { await api.librarySave(collection!.playlist_id || collection!.id, s); collection = { ...collection!, saved: s }; } catch (e) { err = String(e); } }}>
                     <Hi icon={Bookmark02Icon} size={18} /> {collection.saved ? 'Saved' : 'Save'}
@@ -837,7 +905,9 @@
           </div>
         {/if}
 
+        {/if}
       {:else if view.id === 'genre'}
+        {#if loading && !genre}<Skeleton kind="page" />{/if}
         <h1 class="page-title">{genre?.name || (view as { title?: string }).title || ''}</h1>
         {#each genre?.sections ?? [] as s}
           <ShelfRow shelf={s} onPlayItems={playTracks} onOpen={openItem} onContext={contextItem} />
@@ -848,42 +918,81 @@
         <div class="set">
           <div class="set-row">
             <span class="lb"><Hi icon={MusicNote01Icon} size={20} /> Audio quality</span>
-            <select bind:value={settings.quality} onchange={() => api.setSettings(settings)}>
-              <option value="high">High</option>
-              <option value="medium">Medium</option>
-              <option value="low">Low</option>
-            </select>
+            <Dropdown bind:value={settings.quality} options={[
+              { value: 'high', label: 'High' },
+              { value: 'medium', label: 'Medium' },
+              { value: 'low', label: 'Low' },
+            ]} onchange={() => api.setSettings(settings)} />
           </div>
           <div class="set-row">
             <span class="lb"><Hi icon={LanguageCircleIcon} size={20} /> Language</span>
-            <select bind:value={settings.language} onchange={() => api.setSettings(settings)}>
-              <option value="en">English</option>
-              <option value="ro">Română</option>
-              <option value="de">Deutsch</option>
-              <option value="fr">Français</option>
-              <option value="es">Español</option>
-              <option value="pt">Português</option>
-              <option value="it">Italiano</option>
-              <option value="ja">日本語</option>
-              <option value="ko">한국어</option>
-              <option value="zh-CN">中文</option>
-            </select>
+            <Dropdown bind:value={settings.language} options={[
+              { value: 'en', label: 'English' },
+              { value: 'ro', label: 'Română' },
+              { value: 'de', label: 'Deutsch' },
+              { value: 'fr', label: 'Français' },
+              { value: 'es', label: 'Español' },
+              { value: 'pt', label: 'Português' },
+              { value: 'it', label: 'Italiano' },
+              { value: 'ja', label: '日本語' },
+              { value: 'ko', label: '한국어' },
+              { value: 'zh-CN', label: '中文' },
+            ]} onchange={() => api.setSettings(settings)} />
           </div>
           <div class="set-row">
             <span class="lb"><Hi icon={Globe02Icon} size={20} /> Region</span>
-            <select bind:value={settings.region} onchange={() => { api.setSettings(settings); home = null; if (view.id === 'home') loadHome(); }}>
-              {#each ['US','RO','GB','DE','FR','ES','IT','CA','AU','BR','JP','KR','IN','MX','NL','SE','PL'] as r}
-                <option value={r}>{r}</option>
-              {/each}
-            </select>
+            <Dropdown bind:value={settings.region} options={['US','RO','GB','DE','FR','ES','IT','CA','AU','BR','JP','KR','IN','MX','NL','SE','PL'].map((r) => ({ value: r, label: r }))} onchange={() => { api.setSettings(settings); home = null; if (view.id === 'home') loadHome(); }} />
           </div>
           <div class="set-row">
             <span class="lb"><Hi icon={Notification01Icon} size={20} /> Notifications</span>
-            <input type="checkbox" bind:checked={settings.notifications} onchange={() => api.setSettings(settings)} />
+            <Toggle bind:checked={settings.notifications} label="Notifications" onchange={() => api.setSettings(settings)} />
           </div>
           <div class="set-row">
             <span class="lb"><Hi icon={Radio02Icon} size={20} /> Autoplay</span>
-            <input type="checkbox" bind:checked={settings.autoplay} onchange={() => api.setSettings(settings)} />
+            <Toggle bind:checked={settings.autoplay} label="Autoplay" onchange={() => api.setSettings(settings)} />
+          </div>
+          <div class="set-row">
+            <span class="lb"><Hi icon={MusicNote01Icon} size={20} /> Crossfade</span>
+            <Toggle bind:checked={settings.crossfade} label="Crossfade" onchange={() => api.setSettings(settings)} />
+          </div>
+          <div class="set-row">
+            <span class="lb">Crossfade duration
+              <span class="t-meta" style="display:block;font-weight:450;margin-top:2px">{settings.crossfade_seconds.toFixed(1)}s</span>
+            </span>
+            <div style="width:200px">
+              <Slider
+                value={settings.crossfade_seconds}
+                max={12}
+                live={true}
+                showTip={true}
+                format={(v) => `${v.toFixed(1)}s`}
+                oninput={(v) => { settings.crossfade_seconds = Math.round(v * 10) / 10; }}
+                onchange={(v) => { settings.crossfade_seconds = Math.round(v * 10) / 10; api.setSettings(settings); }}
+              />
+            </div>
+          </div>
+          <div class="set-row">
+            <span class="lb">Album continuity
+              <span class="t-meta" style="display:block;font-weight:450;margin-top:2px">No crossfade between tracks on the same album</span>
+            </span>
+            <Toggle bind:checked={settings.album_continuity} label="Album continuity" onchange={() => api.setSettings(settings)} />
+          </div>
+          <div class="set-row">
+            <span class="lb"><Hi icon={Bookmark02Icon} size={20} /> Offline cache
+              <span class="t-meta" style="display:block;font-weight:450;margin-top:2px">{fmtCache(cacheUsed)} of {fmtCache(cacheMax)}</span>
+            </span>
+            <Dropdown
+              value={String(settings.cache_max_mb)}
+              options={[
+                { value: '0', label: 'Off' },
+                { value: '256', label: '256 MB' },
+                { value: '512', label: '512 MB' },
+                { value: '1024', label: '1 GB' },
+                { value: '2048', label: '2 GB' },
+                { value: '4096', label: '4 GB' },
+              ]}
+              onchange={(v) => { settings.cache_max_mb = Number(v); api.setSettings(settings); refreshCacheStats(); }}
+            />
           </div>
           {#if auth.signed_in}
             <div class="set-row">
@@ -909,8 +1018,8 @@
       </div>
       <div class="panel-b">
         {#if panel === 'queue'}
-          {#each player.queue as t, i}
-            <button class="q-item {i === player.index ? 'on' : ''}" type="button" onclick={() => playTracks(player.queue, i)} oncontextmenu={(e) => contextTrack(e, t)}>
+          {#each player.queue as t, i (`${i}:${t.id}`)}
+            <button class="q-item {i === player.index ? 'on' : ''}" type="button" onclick={() => playTracks(player.queue, i)} oncontextmenu={(e) => contextTrack(e, t)} onmouseenter={() => t.id && api.prefetch(t.id)}>
               <Cover src={t.cover} size={40} alt="" />
               <div class="tx">
                 <div class="tn">{t.title}</div>
@@ -936,7 +1045,7 @@
           </div>
         {:else if panel === 'related' && related}
           {#if related.tracks.length}
-            {#each related.tracks as t, i}
+            {#each related.tracks as t, i (t.id || i)}
               <button class="q-item" type="button" onclick={() => playTracks(related!.tracks, i)} oncontextmenu={(e) => contextTrack(e, t)}>
                 <Cover src={t.cover} size={40} alt="" />
                 <div class="tx"><div class="tn">{t.title}</div><div class="ta">{artistsLine(t.artists)}</div></div>
@@ -946,7 +1055,7 @@
           {#if related.artists.length}
             <div class="shelf-title" style="font-size:16px;margin:16px 8px 8px">Artists</div>
             <div class="row">
-              {#each related.artists as a}
+              {#each related.artists as a (a.id)}
                 <button class="card artist" type="button" onclick={() => go({ id: 'artist', artistId: a.id })}>
                   <div class="art"><Cover src={a.cover} size={132} round alt="" /></div>
                   <div class="c-a"><div class="title">{a.name}</div></div>
@@ -1048,7 +1157,7 @@
         {#if player.loading}<div class="spin"></div>{/if}
         <IconBtn icon={MicVocalIcon} size={22} on={panel === 'lyrics'} onclick={() => openPanel('lyrics')} title="Lyrics" btnSize="lg" />
         <IconBtn icon={Queue02Icon} size={22} on={panel === 'queue'} onclick={() => openPanel('queue')} title="Queue" btnSize="lg" />
-        <IconBtn icon={Radio02Icon} size={22} onclick={() => player.track && api.radio(player.track.id)} title="Radio" btnSize="lg" />
+        <IconBtn icon={Radio02Icon} size={22} onclick={() => startRadio()} title="Radio" btnSize="lg" />
         <div class="vol">
           <Hi icon={player.volume < 0.01 ? VolumeMute01Icon : VolumeHighIcon} size={20} />
           <Slider
@@ -1074,7 +1183,7 @@
     onPlay={() => ctx?.track && playOne(ctx.track)}
     onPlayNext={() => ctx?.track && api.queueAdd([ctx.track], true)}
     onQueue={() => ctx?.track && api.queueAdd([ctx.track], false)}
-    onRadio={() => ctx?.track && api.radio(ctx.track.id)}
+    onRadio={() => ctx?.track && startRadio(ctx.track.id)}
     onLike={() => ctx?.track && api.like(ctx.track.id, 'like')}
     onDislike={() => ctx?.track && api.like(ctx.track.id, 'dislike')}
     onArtist={() => goArtist(ctx?.artistId || ctx?.track?.artist_ids?.[0] || '', ctx?.track?.artists?.[0])}
