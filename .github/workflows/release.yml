@@ -51,7 +51,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev \
-            librsvg2-dev patchelf libssl-dev pkg-config libdbus-1-dev rpm
+            librsvg2-dev patchelf libssl-dev pkg-config libdbus-1-dev \
+            libasound2-dev rpm
       - run: npm ci
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -89,7 +90,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libssl-dev pkg-config libdbus-1-dev
+            libssl-dev pkg-config libdbus-1-dev \
+            libasound2-dev
       - run: npm ci
       - name: init and build apk
         env:
