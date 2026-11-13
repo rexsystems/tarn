@@ -4,6 +4,7 @@ mod cache;
 mod color;
 pub mod decode;
 mod innertube;
+mod player_client;
 mod login;
 mod mix;
 mod mpris;
@@ -1158,6 +1159,7 @@ pub fn run() {
                 restore_session(&app_restore).await;
                 restore_playback(&app_restore).await;
             });
+            app.ytm.prewarm_players();
             tauri::async_runtime::spawn(async {
                 crate::ytdlp::maybe_update().await;
             });

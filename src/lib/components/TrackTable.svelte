@@ -33,6 +33,13 @@
     onMore?: (e: MouseEvent, t: Track, i: number) => void;
     fallbackCover?: string | null;
   } = $props();
+
+  // Prewarm resolve for rows the user can already see.
+  $effect(() => {
+    for (const t of tracks.slice(0, 8)) {
+      if (t.id) api.prefetch(t.id);
+    }
+  });
 </script>
 
 <table class="tbl">

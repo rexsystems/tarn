@@ -16,6 +16,7 @@ use tokio::process::Command;
 
 use crate::auth;
 use crate::innertube::{self, InnerTube};
+use crate::player_client::{PlayerHub, ResolveCache};
 use crate::models::{
     AccountInfo, ArtistCard, ArtistPage, Collection, Explore, GenrePage, Home, Library, LikeState,
     Lyrics, PlaylistCard, Related, SearchResults, Settings, Shelf, ShelfItem, Track,
@@ -41,6 +42,8 @@ pub struct Ytm {
     bodies: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::decode::GrowingBody>>>,
     pub cache: std::sync::Arc<crate::cache::AudioCache>,
     radio: Mutex<Option<rustypipe::model::paginator::Paginator<TrackItem>>>,
+    players: std::sync::Arc<PlayerHub>,
+    resolve_disk: ResolveCache,
 }
 
 impl Ytm {
@@ -74,6 +77,8 @@ impl Ytm {
             bodies: Mutex::new(std::collections::HashMap::new()),
             cache: std::sync::Arc::new(crate::cache::AudioCache::open()),
             radio: Mutex::new(None),
+            players: std::sync::Arc::new(PlayerHub::new()?),
+            resolve_disk: ResolveCache::open(),
         })
     }
 
@@ -82,6 +87,13 @@ impl Ytm {
         *self.country.lock().unwrap() = s.region.clone();
         *self.quality.lock().unwrap() = s.quality.clone();
         self.cache.set_max_mb(s.cache_max_mb);
+    }
+
+    pub fn prewarm_players(&self) {
+        let players = self.players.clone();
+        tokio::spawn(async move {
+            players.prewarm().await;
+        });
     }
 
     pub fn cookies_file(&self) -> &PathBuf {
@@ -1144,17 +1156,31 @@ impl Ytm {
     }
 
     fn cached_stream(&self, id: &str) -> Option<Stream> {
-        let mut g = self.streams.lock().unwrap();
-        if let Some(c) = g.get(id) {
-            if stream_is_fresh(&c.stream, c.at) {
-                return Some(c.stream.clone());
+        {
+            let mut g = self.streams.lock().unwrap();
+            if let Some(c) = g.get(id) {
+                if stream_is_fresh(&c.stream, c.at) {
+                    return Some(c.stream.clone());
+                }
             }
+            g.remove(id);
         }
-        g.remove(id);
+        if let Some(s) = self.resolve_disk.get(id, None) {
+            self.streams.lock().unwrap().insert(
+                id.to_string(),
+                CachedStream {
+                    stream: s.clone(),
+                    at: Instant::now(),
+                },
+            );
+            crate::diag::log(format!("resolve cache hit {id} ({})", s.label()));
+            return Some(s);
+        }
         None
     }
 
     fn put_stream(&self, id: &str, stream: Stream) {
+        self.resolve_disk.put(id, &stream);
         self.streams.lock().unwrap().insert(
             id.to_string(),
             CachedStream {
@@ -1166,6 +1192,7 @@ impl Ytm {
 
     fn evict_stream(&self, id: &str) {
         self.streams.lock().unwrap().remove(id);
+        self.resolve_disk.evict(id);
     }
 
     /// Drop a cached stream URL and any partial audio so the next play
@@ -1187,6 +1214,7 @@ impl Ytm {
     /// Empty the on-disk audio cache and any in-memory stream URLs.
     pub fn clear_play_cache(&self) {
         self.drop_url_cache();
+        self.resolve_disk.clear();
         self.cache.clear();
     }
 
@@ -1196,55 +1224,115 @@ impl Ytm {
 
     async fn resolve_stream_excluding(&self, video_id: &str, skip: &[&str]) -> Result<Stream> {
         let id = video_id.to_string();
-        let rp = self.rp.clone();
-        let skip_owned: Vec<String> = skip.iter().map(|s| (*s).to_string()).collect();
-        let rustypipe_fut = async {
-            let skip_ref: Vec<&str> = skip_owned.iter().map(|s| s.as_str()).collect();
-            rustypipe_stream(&rp, &id, &skip_ref).await
+        let skip_s: Vec<String> = skip.iter().map(|s| (*s).to_string()).collect();
+        let skip_has = |n: &str| skip_s.iter().any(|s| s == n);
+
+        // Race every client that can produce a playable URL in-process.
+        // VISIONOS (no PO token, unobfuscated AAC) and ANDROID go first
+        // alongside rustypipe iOS/TV. yt-dlp starts after 1.5s only if
+        // nobody has a URL yet — and is cancelled the moment one does.
+        let skip_it = skip_has("visionos") && skip_has("android");
+        let skip_yd = skip_has("yt-dlp");
+        let players = &self.players;
+        let id1 = id.clone();
+        let innertube_fut = async {
+            if skip_it {
+                return Err(anyhow!("innertube skipped"));
+            }
+            players.race(&id1).await
+        };
+
+        let rp2 = self.rp.clone();
+        let id2 = id.clone();
+        let skip_ref_owned = skip_s.clone();
+        let rustypipe_fut = async move {
+            // Let VISIONOS (no PO token, real AAC) try first. rustypipe iOS
+            // often returns a URL sooner that then 403s or is slower to first
+            // sound, and winning the race with it puts us back on yt-dlp.
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let skip_ref: Vec<&str> = skip_ref_owned.iter().map(|s| s.as_str()).collect();
+            rustypipe_stream(&rp2, &id2, &skip_ref).await
         };
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            if !skip.contains(&"yt-dlp") {
-                let cookies = if self.cookies_file.exists() {
-                    Some(self.cookies_file.clone())
-                } else {
-                    None
-                };
-                let q = self.quality();
-                let vid = video_id.to_string();
-                let ytdlp_fut = async move {
-                    // Give rustypipe a head start; start yt-dlp after 800ms
-                    // so a fast iOS/TV URL wins, but a slow one does not
-                    // block the sidecar.
-                    tokio::time::sleep(Duration::from_millis(800)).await;
-                    ytdlp_stream(&vid, cookies.as_deref(), &q).await
-                };
-                tokio::select! {
-                    Ok(s) = rustypipe_fut => {
-                        crate::diag::log(format!("resolve {video_id}: rustypipe {} won", s.label()));
-                        return Ok(s);
-                    }
-                    Ok(s) = ytdlp_fut => {
-                        crate::diag::log(format!("resolve {video_id}: yt-dlp won (sidecar)"));
-                        return Ok(s);
-                    }
-                    else => {}
+            let ytdlp_enabled = !skip_yd;
+            let cookies = if self.cookies_file.exists() {
+                Some(self.cookies_file.clone())
+            } else {
+                None
+            };
+            let q = self.quality();
+            let vid = id.clone();
+            let ytdlp_fut = async move {
+                if !ytdlp_enabled {
+                    return Err(anyhow!("yt-dlp skipped"));
                 }
-                // Both failed (or rustypipe failed before 800ms and yt-dlp
-                // is not in this select branch). Try yt-dlp directly if
-                // rustypipe already lost.
-                let cookies = if self.cookies_file.exists() {
-                    Some(self.cookies_file.clone())
-                } else {
-                    None
-                };
-                let q = self.quality();
-                return ytdlp_stream(video_id, cookies.as_deref(), &q).await;
+                // 1.5s head start for in-process clients. Never block a
+                // successful innertube/rustypipe URL on the sidecar.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                ytdlp_stream(&vid, cookies.as_deref(), &q).await
+            };
+            tokio::pin!(innertube_fut, rustypipe_fut, ytdlp_fut);
+            let mut it_done = false;
+            let mut rp_done = false;
+            let mut yd_done = false;
+            let mut last = None;
+            loop {
+                tokio::select! {
+                    r = &mut innertube_fut, if !it_done => {
+                        it_done = true;
+                        match r {
+                            Ok(s) => {
+                                crate::diag::log(format!("resolve {video_id}: {} won", s.label()));
+                                return Ok(s);
+                            }
+                            Err(e) => {
+                                crate::diag::log(format!("resolve {video_id}: innertube {e}"));
+                                last = Some(e);
+                            }
+                        }
+                    }
+                    r = &mut rustypipe_fut, if !rp_done => {
+                        rp_done = true;
+                        match r {
+                            Ok(s) => {
+                                crate::diag::log(format!("resolve {video_id}: {} won", s.label()));
+                                return Ok(s);
+                            }
+                            Err(e) => {
+                                crate::diag::log(format!("resolve {video_id}: rustypipe {e}"));
+                                last = Some(e);
+                            }
+                        }
+                    }
+                    r = &mut ytdlp_fut, if !yd_done => {
+                        yd_done = true;
+                        match r {
+                            Ok(s) => {
+                                crate::diag::log(format!("resolve {video_id}: yt-dlp won (sidecar, delayed)"));
+                                return Ok(s);
+                            }
+                            Err(e) => {
+                                crate::diag::log(format!("resolve {video_id}: yt-dlp {e}"));
+                                last = Some(e);
+                            }
+                        }
+                    }
+                    else => break,
+                }
             }
+            Err(last.unwrap_or_else(|| anyhow!("no client resolved {video_id}")))
         }
 
-        rustypipe_fut.await
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            match innertube_fut.await {
+                Ok(s) => return Ok(s),
+                Err(e) => crate::diag::log(format!("resolve {video_id}: innertube {e}")),
+            }
+            rustypipe_fut.await
+        }
     }
 
     /// Start a progressive download and return once enough of the file is
@@ -1395,6 +1483,7 @@ impl Ytm {
         let rp = self.rp.clone();
         let cookies_file = self.cookies_file.clone();
         let quality = self.quality();
+        let players = self.players.clone();
         tokio::spawn(async move {
             let c = if id.is_empty() {
                 None
@@ -1402,7 +1491,7 @@ impl Ytm {
                 Some((cache, id.clone()))
             };
             if let Err(e) =
-                download_into(&stream, &body2, c, &rp, &id, &cookies_file, &quality).await
+                download_into(&stream, &body2, c, &rp, &id, &cookies_file, &quality, Some(players)).await
             {
                 body2.fail(e.to_string());
             } else {
@@ -1771,6 +1860,7 @@ pub fn seed_first(mut tracks: Vec<Track>, seed: Option<Track>, id: &str) -> Vec<
     tracks
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_into(
     stream: &Stream,
     body: &crate::decode::GrowingBody,
@@ -1779,13 +1869,12 @@ async fn download_into(
     video_id: &str,
     cookies_file: &std::path::Path,
     quality: &str,
+    players: Option<std::sync::Arc<PlayerHub>>,
 ) -> Result<()> {
-    // googlevideo 403s an open-ended `Range: bytes=N-` on iOS/TV URLs, and
-    // it also 403s a given URL after roughly four 256 KiB closed-range
-    // requests (~1 MiB). That left every song stuck at ~20% buffered.
-    // Start with a 256 KiB chunk so playback can begin quickly, then pull
-    // 2 MiB at a time. On 403/410, re-resolve a fresh URL for the *same
-    // itag* and resume from the last byte — never splice a different format.
+    // A second Range on the same googlevideo URL is what 403s after ~1 MiB
+    // when the client has no GVS PO token. VISIONOS (and often others) will
+    // serve the *entire* file on a single closed-range request; GrowingBody
+    // still signals ready at 256 KiB so first-sound is not delayed.
     const FIRST: u64 = 256 * 1024;
     const CHUNK: u64 = 2 * 1024 * 1024;
     if let Some(n) = url_query_u64(&stream.url, "clen") {
@@ -1798,6 +1887,7 @@ async fn download_into(
     let mut net_tries = 0u32;
     let mut same_client_hits = 0u32;
     let mut last_log = 0u64;
+    let mut tried_oneshot = false;
 
     loop {
         let offset = body.len() as u64;
@@ -1806,10 +1896,19 @@ async fn download_into(
                 break;
             }
         }
-        let want = if offset == 0 { FIRST } else { CHUNK };
-        let end = match body.content_len() {
-            Some(total) => (offset + want - 1).min(total.saturating_sub(1)),
-            None => offset + want - 1,
+        // First request: ask for the whole file. If that 403s immediately,
+        // fall through to chunked ranges (and re-resolve).
+        let end = if offset == 0 && !tried_oneshot {
+            tried_oneshot = true;
+            body.content_len()
+                .map(|t| t.saturating_sub(1))
+                .unwrap_or(64 * 1024 * 1024 - 1)
+        } else {
+            let want = if offset == 0 { FIRST } else { CHUNK };
+            match body.content_len() {
+                Some(total) => (offset + want - 1).min(total.saturating_sub(1)),
+                None => offset + want - 1,
+            }
         };
         if end < offset {
             break;
@@ -1862,6 +1961,7 @@ async fn download_into(
                     cookies_file,
                     quality,
                     false,
+                    players.as_deref(),
                 )
                 .await
                 {
@@ -1892,6 +1992,7 @@ async fn download_into(
                     cookies_file,
                     quality,
                     same_client_hits >= 2,
+                    players.as_deref(),
                 )
                 .await
                 {
@@ -1922,6 +2023,7 @@ async fn download_into(
                         cookies_file,
                         quality,
                         true,
+                        players.as_deref(),
                     )
                     .await
                     {
@@ -1985,11 +2087,34 @@ async fn reresolve_from(
     cookies_file: &std::path::Path,
     quality: &str,
     skip_same: bool,
+    players: Option<&PlayerHub>,
 ) -> Result<Stream> {
     if video_id.is_empty() {
         return Err(anyhow!("cannot re-resolve an empty id"));
     }
     let want = current.itag();
+    // Prefer a fresh VISIONOS/ANDROID URL — these complete a full file
+    // in one request and do not need a PO token today.
+    if let Some(hub) = players {
+        match hub.race(video_id).await {
+            Ok(s) if itag_ok(want, s.itag()) || want.is_none() => {
+                eprintln!(
+                    "audio: re-resolved {} itag={:?} (was {:?})",
+                    s.label(),
+                    s.itag(),
+                    want
+                );
+                return Ok(s);
+            }
+            Ok(s) => eprintln!(
+                "audio: innertube {} itag {:?} != {:?}",
+                s.label(),
+                s.itag(),
+                want
+            ),
+            Err(e) => eprintln!("audio: innertube re-resolve: {e}"),
+        }
+    }
     // Fast path: the same rustypipe client that already worked. A mid-file
     // 403 is a stale URL, not a bad client — don't walk every client
     // (and wait 20–30s) before we can resume.
@@ -2099,7 +2224,9 @@ async fn rustypipe_one(rp: &RustyPipe, id: &str, ctype: ClientType) -> Result<St
         client: used_name,
         expire: url_expire(&audio.url),
     };
-    probe_stream(&stream).await?;
+    // Do not probe with a tiny Range: that counts as the first request,
+    // and a second Range on the same URL is what 403s without a PO token.
+    // The real download starts a single full-file request instead.
     Ok(stream)
 }
 
@@ -2228,6 +2355,7 @@ async fn download_chunk(
 
 /// Confirm a googlevideo URL answers with the given client headers.
 /// Used so a 403 is caught before we cache the URL or start decoding.
+#[allow(dead_code)]
 async fn probe_stream(stream: &Stream) -> Result<()> {
     let ua = stream_ua(stream);
     let client = reqwest::Client::builder()
@@ -2375,16 +2503,8 @@ async fn rustypipe_stream(rp: &RustyPipe, id: &str, skip: &[&str]) -> Result<Str
                     client: used_name,
                     expire: url_expire(&audio.url),
                 };
-                match probe_stream(&stream).await {
-                    Ok(()) => {
-                        eprintln!("stream: rustypipe {used_name} ({})", audio.mime);
-                        return Ok(stream);
-                    }
-                    Err(e) => {
-                        eprintln!("stream probe {used_name}: {e}");
-                        last = Some(e);
-                    }
-                }
+                eprintln!("stream: rustypipe {used_name} ({})", audio.mime);
+                return Ok(stream);
             }
             Err(e) => {
                 eprintln!("rustypipe {name}: {e}");
