@@ -59,6 +59,10 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Repo secrets: TAURI_SIGNING_PRIVATE_KEY and optional
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD. Public key is in tauri.conf.json.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Tarn ${{ github.ref_name }}
@@ -68,6 +72,7 @@ jobs:
             Tarn is self-contained — you do not need to install ffmpeg, yt-dlp, or any other extra tools.
           releaseDraft: false
           prerelease: false
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
 
   android:

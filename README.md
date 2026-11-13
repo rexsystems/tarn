@@ -9,7 +9,9 @@ A fast YouTube Music desktop client. Built with Tauri 2, Rust, and Svelte. Works
 
 ## Install
 
-Downloads are on the [releases](https://github.com/rexsystems/tarn/releases) page: AppImage, rpm and deb for Linux, NSIS/MSI for Windows, dmg for macOS.
+The website is at [rexsystems.github.io/tarn](https://rexsystems.github.io/tarn). Downloads are on the [releases](https://github.com/rexsystems/tarn/releases) page: AppImage, rpm and deb for Linux, NSIS/MSI for Windows, dmg for macOS.
+
+Packaged builds check for signed updates on their own. A "Check for updates" button is also in Settings.
 
 Tarn is self-contained. You do not need to install ffmpeg, yt-dlp, or any other extra tools — audio is decoded in-process, and a current yt-dlp is bundled and updated automatically.
 

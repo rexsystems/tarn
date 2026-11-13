@@ -22,6 +22,7 @@
   import Skeleton from './lib/components/Skeleton.svelte';
   import SearchBar from './lib/components/SearchBar.svelte';
   import Toast from './lib/components/Toast.svelte';
+  import UpdatePrompt from './lib/components/UpdatePrompt.svelte';
   import { fail, authPrompt } from './lib/toast';
   import { friendlyError, isAuthError } from './lib/errors';
   import { localLikes, isLocalLiked, setLocalLiked, localRecents, recordRecent } from './lib/local';
@@ -48,6 +49,8 @@
   let library = $state<Library | null>(null);
   let history = $state<Track[] | null>(null);
   let auth = $state<AuthStatus>({ signed_in: false, mock: false, account: null, store: null });
+  let updateCheck = $state(0);
+  let appVersion = $state('0.1.0');
   let settings = $state<SettingsT>({ quality: 'high', language: 'en', region: 'US', notifications: false, autoplay: true, cache_max_mb: 1024, crossfade: true, crossfade_seconds: 4, album_continuity: true });
   let player = $state<PlayerState>({
     track: null, playing: false, loading: false, position: 0, duration: 0,
@@ -127,6 +130,7 @@
       if (view.id === 'home') await loadHome();
       if (auth.signed_in) loadLibrary();
     })();
+    import('@tauri-apps/api/app').then((m) => m.getVersion()).then((v) => { appVersion = v; }).catch(() => {});
     listen<PlayerState>('player', (e) => {
       const next = e.payload;
       if (!auth.signed_in && next.track && isLocalLiked(next.track.id)) {
@@ -1215,6 +1219,12 @@
               onchange={(v) => { settings.cache_max_mb = Number(v); api.setSettings(settings); refreshCacheStats(); }}
             />
           </div>
+          <div class="set-row">
+            <span class="lb">Updates
+              <span class="t-meta" style="display:block;font-weight:450;margin-top:2px">Tarn {appVersion}</span>
+            </span>
+            <button class="upd-check" type="button" onclick={() => (updateCheck += 1)}>Check for updates</button>
+          </div>
           {#if auth.signed_in}
             <div class="set-row">
               <span class="lb"><Hi icon={Logout03Icon} size={20} /> {auth.account?.name || 'Account'}</span>
@@ -1395,6 +1405,7 @@
 </div>
 
 <Toast />
+<UpdatePrompt bind:request={updateCheck} />
 
 {#if ctx}
   <ContextMenu

@@ -46,6 +46,15 @@
     "category": "Music",
     "externalBin": [
       "binaries/yt-dlp"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUxQjk2QjZDRjE3M0U0MTQKUldRVTVIUHhiR3U1NFZRditOcUoyWHlob3F0cWwycmg4eGZPODlyOEtVSDk5UmRDRkl3M0x1bksK",
+      "endpoints": [
+        "https://github.com/rexsystems/tarn/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

@@ -960,8 +960,14 @@ pub fn run() {
     };
 
     let app_for_setup = app.clone();
-    tauri::Builder::default()
-        .manage(app)
+    let mut builder = tauri::Builder::default().manage(app);
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
+    builder
         .setup(move |tauri_app| {
             let handle = tauri_app.handle().clone();
             let app = app_for_setup.clone();
