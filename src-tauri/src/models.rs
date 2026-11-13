@@ -234,6 +234,10 @@ pub struct Settings {
     /// Desktop track-change notifications. Off by default.
     #[serde(default)]
     pub notifications: bool,
+    /// Set after the one-shot migration that turns the old default (on)
+    /// into off. Missing from older settings.json files.
+    #[serde(default = "default_true")]
+    pub notifications_migrated: bool,
     pub autoplay: bool,
     /// Disk cache cap for prefetched audio, in mebibytes. 0 disables it.
     #[serde(default = "default_cache_mb")]
@@ -253,6 +257,7 @@ impl Default for Settings {
             language: "en".into(),
             region: "US".into(),
             notifications: false,
+            notifications_migrated: true,
             autoplay: true,
             cache_max_mb: default_cache_mb(),
             crossfade: true,
@@ -284,6 +289,11 @@ pub struct PlayerState {
     pub track: Option<Track>,
     pub playing: bool,
     pub loading: bool,
+    #[serde(default)]
+    pub buffering: bool,
+    /// Seconds of the track already downloaded (from the start).
+    #[serde(default)]
+    pub buffered: f64,
     pub position: f64,
     pub duration: f64,
     pub volume: f32,
@@ -305,6 +315,8 @@ impl Default for PlayerState {
             track: None,
             playing: false,
             loading: false,
+            buffering: false,
+            buffered: 0.0,
             position: 0.0,
             duration: 0.0,
             volume: 0.85,

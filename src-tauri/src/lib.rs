@@ -118,9 +118,23 @@ pub fn notify_icon() -> Option<String> {
 
 fn load_settings(dir: &std::path::Path) -> Settings {
     let p = dir.join("settings.json");
-    if let Ok(s) = std::fs::read_to_string(p) {
-        if let Ok(v) = serde_json::from_str::<Settings>(&s) {
-            return v;
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&s) {
+            if let Ok(mut v) = serde_json::from_value::<Settings>(raw.clone()) {
+                // One-shot: older builds defaulted notifications to on, and
+                // that value was saved. Flip those to off exactly once.
+                if raw.get("notifications_migrated").is_none() {
+                    if v.notifications {
+                        eprintln!(
+                            "settings: migrating notifications from on (old default) to off"
+                        );
+                    }
+                    v.notifications = false;
+                    v.notifications_migrated = true;
+                    save_settings(dir, &v);
+                }
+                return v;
+            }
         }
     }
     Settings::default()
@@ -336,8 +350,16 @@ pub(crate) async fn start_playback_at(
     let id = track.id.clone();
     let cover = track.cover.clone();
     let snap = app.player.snapshot();
+    let same = snap
+        .track
+        .as_ref()
+        .is_some_and(|t| t.id == track.id);
+    // Mid-track re-resolve must not crossfade or cut into itself, and must
+    // keep the current position (set_loading used to zero it).
     let style = if paused {
         crate::player::PlayStyle::Armed
+    } else if same && start > 0.05 {
+        crate::player::PlayStyle::Fresh
     } else if snap.playing && snap.track.is_some() {
         if app.player.should_crossfade(snap.track.as_ref(), &track) {
             crate::player::PlayStyle::Crossfade(app.player.crossfade_secs())
@@ -351,11 +373,7 @@ pub(crate) async fn start_playback_at(
         app.player.set_duration(d as f64);
     }
     app.player.set_rating(false, false);
-    if paused {
-        app.player.prepare(track, queue.clone(), index, start, true);
-    } else {
-        app.player.set_loading(track, queue.clone(), index);
-    }
+    app.player.prepare(track, queue.clone(), index, start, true);
 
     // Cover/accent is decorative — never block the play path on it.
     if let Some(url) = cover {
@@ -449,7 +467,23 @@ fn prefetch_ahead(app: &App, queue: &[Track], index: usize) {
     let ytm = app.ytm.clone();
     let player = app.player.clone();
     tauri::async_runtime::spawn(async move {
+        // Don't steal bandwidth from a starving current track.
+        for _ in 0..40 {
+            if !player.is_buffering() {
+                let st = player.snapshot();
+                if st.buffered >= st.position + 10.0
+                    || (st.duration > 0.0 && st.buffered + 0.4 >= st.duration)
+                    || st.track.is_none()
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
         for id in &ids {
+            if player.is_buffering() {
+                break;
+            }
             ytm.prefetch(id).await;
         }
         if remaining < 3 {
@@ -813,6 +847,9 @@ fn get_settings(app: State<Arc<App>>) -> Settings {
 
 #[tauri::command]
 fn set_settings(app: State<Arc<App>>, settings: Settings) {
+    let mut settings = settings;
+    // Keep the one-shot flag so a later load does not flip the user off again.
+    settings.notifications_migrated = true;
     app.ytm.apply_settings(&settings);
     *app.notify.lock() = settings.notifications;
     app.player.set_autoplay(settings.autoplay);
@@ -926,6 +963,23 @@ fn emit_loop(handle: AppHandle, app: Arc<App>) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             maybe_blend(&app);
+            if let Some((track, queue, index, pos, play)) = app.player.take_recover() {
+                let app2 = app.clone();
+                let handle2 = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    eprintln!(
+                        "recover: re-resolving {} at {:.2}s (play={play})",
+                        track.id, pos
+                    );
+                    app2.ytm.invalidate(&track.id);
+                    let r = start_playback_at(&app2, track, queue, index, pos, !play).await;
+                    app2.player.recover_finished();
+                    if let Err(e) = r {
+                        eprintln!("recover failed: {e}; not advancing");
+                    }
+                    let _ = handle2.emit("player", app2.player.snapshot());
+                });
+            }
             if app.player.take_ended() {
                 let app2 = app.clone();
                 let handle2 = handle.clone();
@@ -1072,4 +1126,86 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "tarn-settings-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn fresh_profile_notifications_off() {
+        let dir = tmp_dir("fresh");
+        let s = load_settings(&dir);
+        assert!(!s.notifications);
+        assert!(s.notifications_migrated);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_default_on_migrates_once() {
+        let dir = tmp_dir("old-on");
+        // A settings.json written by a build that defaulted notifications to on,
+        // without the migration flag.
+        fs::write(
+            dir.join("settings.json"),
+            r#"{
+                "quality": "high",
+                "language": "en",
+                "region": "US",
+                "notifications": true,
+                "autoplay": true,
+                "cache_max_mb": 1024,
+                "crossfade": true,
+                "crossfade_seconds": 4.0,
+                "album_continuity": true
+            }"#,
+        )
+        .unwrap();
+        let s = load_settings(&dir);
+        assert!(!s.notifications, "old default on must flip to off");
+        assert!(s.notifications_migrated);
+        // User turns them back on; a later load must not flip again.
+        let mut on = s.clone();
+        on.notifications = true;
+        save_settings(&dir, &on);
+        let again = load_settings(&dir);
+        assert!(again.notifications, "must not re-migrate after the one-shot");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn already_off_still_gets_the_flag() {
+        let dir = tmp_dir("old-off");
+        fs::write(
+            dir.join("settings.json"),
+            r#"{
+                "quality": "high",
+                "language": "en",
+                "region": "US",
+                "notifications": false,
+                "autoplay": true,
+                "cache_max_mb": 1024,
+                "crossfade": true,
+                "crossfade_seconds": 4.0,
+                "album_continuity": true
+            }"#,
+        )
+        .unwrap();
+        let s = load_settings(&dir);
+        assert!(!s.notifications);
+        assert!(s.notifications_migrated);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

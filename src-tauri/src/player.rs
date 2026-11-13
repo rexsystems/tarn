@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -57,6 +57,12 @@ pub struct Player {
     blending: Arc<AtomicBool>,
     /// If the user hits play while a session is still arming.
     want_play: Arc<AtomicBool>,
+    buffering: Arc<AtomicBool>,
+    recover: Arc<AtomicBool>,
+    has_src: Arc<AtomicBool>,
+    recovering: Arc<AtomicBool>,
+    last_ended: Arc<Mutex<Option<String>>>,
+    last_recover: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Player {
@@ -74,6 +80,12 @@ impl Player {
         let album_cont = Arc::new(AtomicBool::new(true));
         let blending = Arc::new(AtomicBool::new(false));
         let want_play = Arc::new(AtomicBool::new(false));
+        let buffering = Arc::new(AtomicBool::new(false));
+        let recover = Arc::new(AtomicBool::new(false));
+        let has_src = Arc::new(AtomicBool::new(false));
+        let recovering = Arc::new(AtomicBool::new(false));
+        let last_ended = Arc::new(Mutex::new(None));
+        let last_recover = Arc::new(Mutex::new(None));
 
         let samples_t = samples.clone();
         let rate_t = sample_rate.clone();
@@ -82,11 +94,26 @@ impl Player {
         let phase_t = phase.clone();
         let audio_t = current_audio.clone();
         let state_t = state.clone();
+        let buffering_t = buffering.clone();
+        let recover_t = recover.clone();
+        let has_src_t = has_src.clone();
 
         std::thread::Builder::new()
             .name("tarn-audio".into())
             .spawn(move || {
-                audio_thread(rx, samples_t, rate_t, ch_t, ended_t, phase_t, audio_t, state_t)
+                audio_thread(
+                    rx,
+                    samples_t,
+                    rate_t,
+                    ch_t,
+                    ended_t,
+                    phase_t,
+                    audio_t,
+                    state_t,
+                    buffering_t,
+                    recover_t,
+                    has_src_t,
+                )
             })
             .expect("audio thread");
 
@@ -104,6 +131,12 @@ impl Player {
             album_cont,
             blending,
             want_play,
+            buffering,
+            recover,
+            has_src,
+            recovering,
+            last_ended,
+            last_recover,
         }
     }
 
@@ -112,16 +145,26 @@ impl Player {
         let rate = self.sample_rate.load(Ordering::Relaxed).max(1) as f64
             * self.channels.load(Ordering::Relaxed).max(1) as f64;
         let extra = self.samples.load(Ordering::Relaxed) as f64 / rate;
+        let ph = self.phase.load(Ordering::Relaxed);
         // `position` in state is the seek origin; add consumed samples.
-        if self.phase.load(Ordering::Relaxed) != 0 {
+        // Phase 4 (buffering) keeps the last position: the mixer pauses the
+        // clock, so `extra` does not run ahead of the audio.
+        if ph != 0 {
             s.position = (s.position + extra).min(if s.duration > 0.0 {
                 s.duration
             } else {
                 f64::MAX
             });
         }
-        s.playing = self.phase.load(Ordering::Relaxed) == 1;
-        s.loading = self.phase.load(Ordering::Relaxed) == 3;
+        s.playing = ph == 1 || ph == 4;
+        s.loading = ph == 3;
+        let body = self.current_audio.lock().clone();
+        let body_buf = body.as_ref().is_some_and(|b| b.is_buffering() || b.is_stalled());
+        s.buffering = ph == 4 || self.buffering.load(Ordering::Relaxed) || body_buf;
+        s.buffered = match body {
+            Some(b) => b.buffered_secs(s.duration),
+            None => if s.duration > 0.0 && !s.loading { s.duration } else { 0.0 },
+        };
         s
     }
 
@@ -138,6 +181,9 @@ impl Player {
         loading: bool,
     ) {
         self.ended.store(false, Ordering::Relaxed);
+        self.recover.store(false, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
+        *self.last_ended.lock() = None;
         self.phase
             .store(if loading { 3 } else { 2 }, Ordering::Relaxed);
         self.want_play.store(false, Ordering::Relaxed);
@@ -174,6 +220,9 @@ impl Player {
         let mut s = self.state.lock();
         if d > 0.0 {
             s.duration = d;
+            if let Some(b) = self.current_audio.lock().as_ref() {
+                b.set_duration(d);
+            }
         }
     }
 
@@ -184,6 +233,12 @@ impl Player {
         start: f64,
         style: PlayStyle,
     ) -> Result<()> {
+        {
+            let dur = self.state.lock().duration;
+            if dur > 0.0 {
+                audio.set_duration(dur);
+            }
+        }
         *self.current_audio.lock() = Some(audio.clone());
         self.samples.store(0, Ordering::Relaxed);
         {
@@ -191,6 +246,10 @@ impl Player {
             s.position = start;
         }
         self.ended.store(false, Ordering::Relaxed);
+        if !matches!(style, PlayStyle::Crossfade(_) | PlayStyle::Gapless | PlayStyle::Cut) {
+            *self.last_ended.lock() = None;
+        }
+        self.recovering.store(false, Ordering::Relaxed);
         self.blending.store(
             matches!(style, PlayStyle::Crossfade(_) | PlayStyle::Gapless | PlayStyle::Cut),
             Ordering::Relaxed,
@@ -286,6 +345,8 @@ impl Player {
     }
 
     pub fn adopt_track(&self, track: Track, index: usize) {
+        self.ended.store(false, Ordering::Relaxed);
+        *self.last_ended.lock() = None;
         let mut s = self.state.lock();
         s.track = Some(track);
         s.index = index;
@@ -300,19 +361,80 @@ impl Player {
         let _ = self.tx.send(Cmd::Pause);
     }
     pub fn resume(&self) {
+        if !self.has_src.load(Ordering::Relaxed) {
+            self.request_recover(true);
+            return;
+        }
         let _ = self.tx.send(Cmd::Resume);
     }
     pub fn toggle(&self) {
         match self.phase.load(Ordering::Relaxed) {
-            1 => self.pause(),
+            1 | 4 => self.pause(),
             2 => self.resume(),
             3 => {
                 // Still arming a restored track — play as soon as it's ready.
                 let on = !self.want_play.load(Ordering::Relaxed);
                 self.want_play.store(on, Ordering::Relaxed);
             }
-            _ => {}
+            _ => {
+                // Phase 0: the decoder is dead. Re-resolve at the current
+                // position rather than no-op (Play used to do nothing).
+                if self.state.lock().track.is_some() {
+                    self.request_recover(true);
+                }
+            }
         }
+    }
+
+    pub fn request_recover(&self, play: bool) {
+        if play {
+            self.want_play.store(true, Ordering::Relaxed);
+        }
+        self.recover.store(true, Ordering::SeqCst);
+        eprintln!(
+            "recover: requested at {:.2}s (play={play})",
+            self.snapshot().position
+        );
+    }
+
+    /// One-shot: the emit loop re-resolves the current track at `position`.
+    pub fn take_recover(&self) -> Option<(Track, Vec<Track>, usize, f64, bool)> {
+        if !self.recover.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        {
+            let mut last = self.last_recover.lock();
+            if let Some(t) = *last {
+                if t.elapsed() < Duration::from_secs(2) {
+                    eprintln!("recover: backing off (last attempt {:.1}s ago)", t.elapsed().as_secs_f32());
+                    // Put the flag back so a later tick can retry.
+                    self.recover.store(true, Ordering::SeqCst);
+                    return None;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+        if self.recovering.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let s = self.snapshot();
+        let track = s.track.clone()?;
+        let play = self.want_play.load(Ordering::Relaxed) || s.playing || s.buffering;
+        Some((track, s.queue, s.index, s.position, play))
+    }
+
+    pub fn recover_finished(&self) {
+        self.recovering.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_buffering(&self) -> bool {
+        self.buffering.load(Ordering::Relaxed)
+            || self.phase.load(Ordering::Relaxed) == 4
+            || self
+                .current_audio
+                .lock()
+                .as_ref()
+                .is_some_and(|b| b.is_buffering())
     }
     pub fn stop(&self) {
         let _ = self.tx.send(Cmd::Stop);
@@ -335,7 +457,28 @@ impl Player {
             self.ended.store(false, Ordering::Relaxed);
             return false;
         }
-        self.ended.swap(false, Ordering::Relaxed)
+        if self.recovering.load(Ordering::Relaxed) || self.recover.load(Ordering::Relaxed) {
+            self.ended.store(false, Ordering::Relaxed);
+            return false;
+        }
+        if !self.ended.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        let id = self
+            .state
+            .lock()
+            .track
+            .as_ref()
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        let mut last = self.last_ended.lock();
+        if !id.is_empty() && last.as_deref() == Some(id.as_str()) {
+            eprintln!("track-end ignored (already ended {id})");
+            return false;
+        }
+        *last = Some(id.clone());
+        eprintln!("track-end {id} (complete)");
+        true
     }
     pub fn volume(&self) -> f32 {
         self.state.lock().volume
@@ -517,6 +660,9 @@ fn audio_thread(
     phase: Arc<AtomicU8>,
     current_audio: Arc<Mutex<Option<Arc<crate::decode::GrowingBody>>>>,
     state: Arc<Mutex<PlayerState>>,
+    buffering: Arc<AtomicBool>,
+    recover: Arc<AtomicBool>,
+    has_src: Arc<AtomicBool>,
 ) {
     let (_stream, handle) = match OutputStream::try_default() {
         Ok(v) => v,
@@ -537,6 +683,9 @@ fn audio_thread(
         channels.clone(),
         ended.clone(),
         phase.clone(),
+        buffering.clone(),
+        recover.clone(),
+        has_src.clone(),
     );
     sink.append(mix.source());
     sink.play();
@@ -545,7 +694,7 @@ fn audio_thread(
         let cmd = rx.recv_timeout(Duration::from_millis(80));
         match cmd {
             Ok(Cmd::Play(audio, start)) => {
-                match make_source(audio, start, samples.clone()) {
+                match make_source(audio, start) {
                     Ok(src) => {
                         state.lock().position = start;
                         mix.play(src, crate::mix::CLICK_FADE);
@@ -558,7 +707,7 @@ fn audio_thread(
                 }
             }
             Ok(Cmd::Arm(audio, start)) => {
-                match make_source(audio, start, samples.clone()) {
+                match make_source(audio, start) {
                     Ok(src) => {
                         let mut s = state.lock();
                         s.position = start;
@@ -575,25 +724,30 @@ fn audio_thread(
                 }
             }
             Ok(Cmd::Crossfade(audio, start, secs)) => {
-                match make_source(audio, start, samples.clone()) {
+                match make_source(audio, start) {
                     Ok(src) => mix.crossfade(src, secs),
                     Err(e) => eprintln!("crossfade: {e}"),
                 }
             }
             Ok(Cmd::Gapless(audio, start)) => {
-                match make_source(audio, start, samples.clone()) {
+                match make_source(audio, start) {
                     Ok(src) => mix.queue_gapless(src),
                     Err(e) => eprintln!("gapless: {e}"),
                 }
             }
             Ok(Cmd::Cut(audio, start)) => {
-                match make_source(audio, start, samples.clone()) {
+                match make_source(audio, start) {
                     Ok(src) => mix.cut(src, crate::mix::CLICK_FADE),
                     Err(e) => eprintln!("cut: {e}"),
                 }
             }
             Ok(Cmd::Pause) => mix.pause(),
-            Ok(Cmd::Resume) => mix.resume(),
+            Ok(Cmd::Resume) => {
+                if !mix.resume() {
+                    eprintln!("resume: no decoder; requesting re-resolve");
+                    recover.store(true, Ordering::SeqCst);
+                }
+            }
             Ok(Cmd::Stop) => mix.stop(),
             Ok(Cmd::Seek(secs)) => {
                 // Fade out so the cut isn't a pop, then swap the decoder.
@@ -604,13 +758,32 @@ fn audio_thread(
                 }
                 let audio = current_audio.lock().clone();
                 if let Some(audio) = audio {
-                    match make_source(audio, secs, samples.clone()) {
+                    let needed = audio
+                        .bytes_for_secs(secs)
+                        .saturating_add(crate::decode::READY_BYTES);
+                    audio.request_urgent(needed as u64);
+                    if audio.len() < needed && !audio.is_done() {
+                        eprintln!(
+                            "seek: fetching {needed} bytes for {secs:.2}s (have {})",
+                            audio.len()
+                        );
+                        buffering.store(true, Ordering::Relaxed);
+                        phase.store(4, Ordering::Relaxed);
+                        let _ = audio.wait_len(needed, Duration::from_secs(30));
+                    }
+                    match make_source(audio.clone(), secs) {
                         Ok(src) => {
                             samples.store(0, Ordering::SeqCst);
                             state.lock().position = secs;
                             mix.seek_swap(src);
+                            buffering.store(false, Ordering::Relaxed);
                         }
-                        Err(e) => eprintln!("seek: {e}"),
+                        Err(e) => {
+                            eprintln!("seek: {e}");
+                            if !audio.is_complete() {
+                                recover.store(true, Ordering::SeqCst);
+                            }
+                        }
                     }
                 }
             }
@@ -650,7 +823,6 @@ pub fn decode_head(audio: &[u8], n: usize) -> Result<(u32, u16, usize)> {
 fn make_source(
     audio: Arc<crate::decode::GrowingBody>,
     start: f64,
-    samples: Arc<AtomicU64>,
 ) -> Result<crate::decode::AudioSource> {
-    crate::decode::open(audio, start, samples)
+    crate::decode::open(audio, start)
 }

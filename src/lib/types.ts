@@ -190,6 +190,8 @@ export interface PlayerState {
   track: Track | null;
   playing: boolean;
   loading: boolean;
+  buffering: boolean;
+  buffered: number;
   position: number;
   duration: number;
   volume: number;

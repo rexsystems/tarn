@@ -53,7 +53,8 @@
   let appVersion = $state('0.1.0');
   let settings = $state<SettingsT>({ quality: 'high', language: 'en', region: 'US', notifications: false, autoplay: true, cache_max_mb: 1024, crossfade: true, crossfade_seconds: 4, album_continuity: true });
   let player = $state<PlayerState>({
-    track: null, playing: false, loading: false, position: 0, duration: 0,
+    track: null, playing: false, loading: false, buffering: false, buffered: 0,
+    position: 0, duration: 0,
     volume: 0.85, queue: [], index: 0, error: null, accent: null,
     shuffle: false, repeat: 'off', liked: false, disliked: false, autoplay: true,
   });
@@ -69,6 +70,9 @@
   let navLock = false;
   let panel = $state<null | 'queue' | 'lyrics' | 'related'>(null);
   let expanded = $state(false);
+  let npShow = $state(true);
+  let npHoverChrome = $state(false);
+  let npHideTimer: ReturnType<typeof setTimeout> | undefined;
   let scrub = $state<number | null>(null);
   let lyrics = $state<Lyrics | null>(null);
   let related = $state<Related | null>(null);
@@ -657,10 +661,46 @@
   });
 
   let navOn = (id: string) => view.id === id;
+
+  function armNpHide() {
+    npShow = true;
+    if (npHideTimer) clearTimeout(npHideTimer);
+    if (expanded && !npHoverChrome) {
+      npHideTimer = setTimeout(() => {
+        if (expanded && !npHoverChrome) npShow = false;
+      }, 2500);
+    }
+  }
+
+  function onAppMove() {
+    if (expanded) armNpHide();
+  }
+
+  $effect(() => {
+    if (expanded) armNpHide();
+    else {
+      npShow = true;
+      if (npHideTimer) clearTimeout(npHideTimer);
+    }
+  });
 </script>
 
-<div class="app" style="--player: 112px; --side: 248px; --titlebar: 36px;">
-  <TitleBar canBack={backStack.length > 0} canFwd={fwdStack.length > 0} onBack={goBack} onFwd={goFwd} />
+<div
+  class="app"
+  class:np-open={expanded}
+  class:np-idle={expanded && !npShow}
+  style="--player: 112px; --side: 248px; --titlebar: 36px;"
+  role="application"
+  onmousemove={onAppMove}
+>
+  <div
+    class="tb-wrap"
+    role="presentation"
+    onpointerenter={() => { if (expanded) { npHoverChrome = true; armNpHide(); } }}
+    onpointerleave={() => { if (expanded) { npHoverChrome = false; armNpHide(); } }}
+  >
+    <TitleBar canBack={backStack.length > 0} canFwd={fwdStack.length > 0} onBack={goBack} onFwd={goFwd} />
+  </div>
   <aside class="sidebar" class:is-hidden={expanded}>
     <div class="brand">
       <img src="/logo.png" width="44" height="44" alt="" />
@@ -1303,7 +1343,14 @@
     <div class="np">
       <Cover src={player.track.cover} width={1400} height={900} class="np-bg" alt="" />
       <div class="np-shade"></div>
-      <button class="ibtn lg" type="button" style="position:absolute;top:16px;right:16px;z-index:2" onclick={() => (expanded = false)} title="Close">
+      <button
+        class="ibtn lg np-close"
+        type="button"
+        onclick={() => (expanded = false)}
+        title="Close"
+        onpointerenter={() => { npHoverChrome = true; armNpHide(); }}
+        onpointerleave={() => { npHoverChrome = false; armNpHide(); }}
+      >
         <Hi icon={Cancel01Icon} size={22} />
       </button>
       <div class="np-in">
@@ -1321,7 +1368,11 @@
     </div>
   {/if}
 
-  <footer class="player">
+  <footer
+    class="player"
+    onpointerenter={() => { if (expanded) { npHoverChrome = true; armNpHide(); } }}
+    onpointerleave={() => { if (expanded) { npHoverChrome = false; armNpHide(); } }}
+  >
     <div class="player-in">
       <div class="now">
         {#if player.track}
@@ -1350,11 +1401,12 @@
           <IconBtn
             icon={PlayIcon}
             altIcon={PauseIcon}
-            showAlt={player.playing}
+            showAlt={player.playing && !player.buffering}
             size={28}
             btnSize="xl"
+            spinning={player.buffering || (player.loading && !player.playing)}
             onclick={() => api.toggle()}
-            title={player.playing ? 'Pause' : 'Play'}
+            title={player.buffering ? 'Buffering' : player.playing ? 'Pause' : 'Play'}
             disabled={!player.track && !player.loading}
           />
           <IconBtn icon={NextIcon} size={26} btnSize="lg" onclick={() => api.next()} title="Next" />
@@ -1374,6 +1426,7 @@
           <Slider
             value={player.position}
             max={player.duration || 0}
+            buffered={player.buffered}
             disabled={!player.track || !(player.duration > 0)}
             showTip
             format={fmtTime}

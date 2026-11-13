@@ -491,17 +491,41 @@ html { color-scheme: dark; }
   width: 148px;
   max-width: 148px;
 }
-.card .art, .card .art img, .card .art .ph {
+.card .art {
   width: 152px;
   height: 152px;
   border-radius: 8px;
   background: var(--bg-elev);
-  object-fit: cover;
+  overflow: hidden;
+  position: relative;
+  display: block;
+  line-height: 0;
+  padding: 0;
+  flex: 0 0 152px;
 }
-.card.artist .art, .card.artist .art img, .card.artist .art .ph {
+.card .art img,
+.card .art .ph {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+  object-position: center;
+  background: var(--bg-elev);
+}
+.card.artist .art {
   width: 132px;
   height: 132px;
   border-radius: 66px;
+  flex-basis: 132px;
+}
+.card.artist .art img,
+.card.artist .art .ph {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+  object-position: center;
 }
 .card .c-a { min-width: 0; margin-top: 10px; }
 .card .title {
@@ -560,9 +584,9 @@ html { color-scheme: dark; }
 /* compact track rows (quick picks) */
 .qp {
   display: grid;
-  grid-auto-flow: column;
-  grid-template-rows: repeat(4, 56px);
-  grid-auto-columns: 320px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-auto-flow: row;
+  grid-auto-rows: 56px;
   gap: 4px 16px;
   overflow-x: auto;
   padding-bottom: 4px;
@@ -580,11 +604,13 @@ html { color-scheme: dark; }
 }
 .qp-row:hover { background: var(--bg-hover); }
 .qp-row img, .qp-row .ph {
+  display: block;
   width: 48px;
   height: 48px;
   border-radius: 6px;
   flex: 0 0 48px;
   object-fit: cover;
+  object-position: center;
   background: var(--bg-elev);
 }
 .qp-row .tx { min-width: 0; flex: 1; }
@@ -905,19 +931,32 @@ html { color-scheme: dark; }
   pointer-events: none;
 }
 .sbar-track {
+  position: relative;
   height: 4px;
   width: 100%;
-  background: rgba(255,255,255,0.22);
+  background: rgba(255,255,255,0.18);
   border-radius: 2px;
   overflow: hidden;
   pointer-events: none;
 }
+.sbar-buf {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: 0;
+  background: rgba(255,255,255,0.38);
+  border-radius: 2px;
+  pointer-events: none;
+}
 .sbar-fill {
+  position: relative;
   height: 4px;
   width: 0;
   background: #fff;
   border-radius: 2px;
   pointer-events: none;
+  z-index: 1;
 }
 .sbar-thumb {
   position: absolute;
@@ -945,9 +984,9 @@ html { color-scheme: dark; }
 }
 .sbar-tip {
   position: absolute;
-  bottom: calc(100% + 4px);
+  bottom: calc(100% + 6px);
   transform: translateX(-50%);
-  padding: 2px 6px;
+  padding: 3px 7px;
   border-radius: 4px;
   background: #1c1b19;
   color: #fff;
@@ -958,7 +997,12 @@ html { color-scheme: dark; }
   pointer-events: none;
   white-space: nowrap;
   box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-  z-index: 3;
+  z-index: 30;
+}
+.seek,
+.ctrls,
+.player-in {
+  overflow: visible;
 }
 
 
@@ -1895,3 +1939,59 @@ html { color-scheme: dark; }
 }
 .upd-go:hover, .upd-check:hover { filter: brightness(1.08); }
 .upd-go:disabled, .upd-later:disabled, .upd-check:disabled { opacity: 0.55; }
+
+/* Title bar wrapper (for Now Playing hover stay) */
+.tb-wrap {
+  grid-area: title;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+}
+.tb-wrap .titlebar {
+  grid-area: auto;
+  flex: 1;
+  width: 100%;
+  height: 100%;
+}
+
+/* Buffering spinner on the play button */
+.ibtn.spinning { position: relative; }
+.ibtn-spin {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--line-2);
+  border-top-color: var(--text);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+.ibtn.xl .ibtn-spin { width: 22px; height: 22px; }
+
+/* Fullscreen Now Playing: chrome auto-hides after idle */
+.np-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 24;
+}
+.app.np-open .titlebar,
+.app.np-open .player,
+.app.np-open .np-close {
+  transition: opacity 0.45s ease;
+}
+.app.np-idle .titlebar,
+.app.np-idle .player,
+.app.np-idle .np-close {
+  opacity: 0;
+  pointer-events: none;
+}
+.app.np-open .np-in {
+  /* Keep the art + title centered in the full area, including over the
+     (visually hidden) player and title bar. */
+  padding: 36px 48px;
+}
+
+/* Play overlay is a proper hover affordance, not a stray corner dot */
+.card .art .play-ov,
+.qp-cov .play-ov {
+  border-radius: inherit;
+}

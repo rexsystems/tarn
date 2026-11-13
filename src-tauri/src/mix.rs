@@ -10,7 +10,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rodio::Source;
 
-use crate::decode::AudioSource;
+use crate::decode::{AudioSource, Pull};
 
 /// Fade used for play / pause / resume / seek / skip (~150–300 ms).
 pub const CLICK_FADE: f32 = 0.22;
@@ -22,6 +22,9 @@ pub struct Mixer {
     channels: Arc<AtomicU32>,
     ended: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
+    buffering: Arc<AtomicBool>,
+    recover: Arc<AtomicBool>,
+    has_src: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -45,12 +48,16 @@ struct Inner {
 }
 
 impl Mixer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         samples: Arc<AtomicU64>,
         sample_rate: Arc<AtomicU32>,
         channels: Arc<AtomicU32>,
         ended: Arc<AtomicBool>,
         phase: Arc<AtomicU8>,
+        buffering: Arc<AtomicBool>,
+        recover: Arc<AtomicBool>,
+        has_src: Arc<AtomicBool>,
     ) -> Self {
         let sr = 44100;
         let ch = 2u16;
@@ -77,6 +84,9 @@ impl Mixer {
             channels,
             ended,
             phase,
+            buffering,
+            recover,
+            has_src,
         }
     }
 
@@ -86,6 +96,8 @@ impl Mixer {
             samples: self.samples.clone(),
             ended: self.ended.clone(),
             phase: self.phase.clone(),
+            buffering: self.buffering.clone(),
+            recover: self.recover.clone(),
         }
     }
 
@@ -111,6 +123,9 @@ impl Mixer {
         g.env_tgt = 0.0;
         g.env_step = 0.0;
         self.phase.store(2, Ordering::Relaxed);
+        self.has_src.store(true, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
+        self.recover.store(false, Ordering::Relaxed);
     }
 
     pub fn play(&self, src: AudioSource, fade_in: f32) {
@@ -132,6 +147,9 @@ impl Mixer {
         g.env = 0.0;
         g.set_fade(1.0, fade_in);
         self.phase.store(1, Ordering::Relaxed);
+        self.has_src.store(true, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
+        self.recover.store(false, Ordering::Relaxed);
     }
 
     /// Equal-power overlap of the current decoder with `src`.
@@ -158,6 +176,8 @@ impl Mixer {
         self.ended.store(false, Ordering::Relaxed);
         self.phase.store(1, Ordering::Relaxed);
         self.samples.store(0, Ordering::SeqCst);
+        self.has_src.store(true, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
     }
 
     /// Short fade-out of the current track, then fade-in of `src` (skip).
@@ -177,14 +197,21 @@ impl Mixer {
         self.phase.store(2, Ordering::Relaxed);
     }
 
-    pub fn resume(&self) {
+    pub fn resume(&self) -> bool {
         let mut g = self.inner.lock();
         if g.current.is_none() {
-            return;
+            return false;
         }
         g.paused = false;
         g.set_fade(1.0, CLICK_FADE);
         self.phase.store(1, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
+        true
+    }
+
+    #[allow(dead_code)]
+    pub fn has_current(&self) -> bool {
+        self.has_src.load(Ordering::Relaxed) && self.inner.lock().current.is_some()
     }
 
     pub fn stop(&self) {
@@ -196,6 +223,8 @@ impl Mixer {
         g.current = None;
         g.env = 0.0;
         self.phase.store(0, Ordering::Relaxed);
+        self.has_src.store(false, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
     }
 
     pub fn seek_swap(&self, src: AudioSource) {
@@ -214,6 +243,9 @@ impl Mixer {
         g.env = 0.0;
         g.set_fade(1.0, CLICK_FADE);
         self.phase.store(1, Ordering::Relaxed);
+        self.has_src.store(true, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
+        self.recover.store(false, Ordering::Relaxed);
     }
 
     pub fn env_quiet(&self) -> bool {
@@ -243,6 +275,7 @@ impl Mixer {
         g.paused = false;
         self.ended.store(false, Ordering::Relaxed);
         self.phase.store(1, Ordering::Relaxed);
+        self.has_src.store(true, Ordering::Relaxed);
     }
 }
 
@@ -270,6 +303,8 @@ pub struct MixerSource {
     samples: Arc<AtomicU64>,
     ended: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
+    buffering: Arc<AtomicBool>,
+    recover: Arc<AtomicBool>,
 }
 
 impl MixerSource {
@@ -287,13 +322,25 @@ impl MixerSource {
         let mut b_alive = false;
 
         let frozen = g.paused && g.env <= 0.02 && g.incoming.is_none();
+        let mut a_buf = false;
+        let mut a_stall: Option<String> = None;
+        let mut b_buf = false;
         if !frozen {
             if let Some(src) = g.current.as_mut() {
                 a_alive = true;
                 for s in a.iter_mut() {
-                    match src.next() {
-                        Some(v) => *s = v,
-                        None => {
+                    match src.pull() {
+                        Pull::Sample(v) => *s = v,
+                        Pull::Buffering => {
+                            a_buf = true;
+                            break;
+                        }
+                        Pull::Ended => {
+                            a_alive = false;
+                            break;
+                        }
+                        Pull::Stall(e) => {
+                            a_stall = Some(e);
                             a_alive = false;
                             break;
                         }
@@ -306,9 +353,17 @@ impl MixerSource {
                 if let Some(src) = g.incoming.as_mut() {
                     b_alive = true;
                     for s in b.iter_mut() {
-                        match src.next() {
-                            Some(v) => *s = v,
-                            None => {
+                        match src.pull() {
+                            Pull::Sample(v) => *s = v,
+                            Pull::Buffering => {
+                                b_buf = true;
+                                break;
+                            }
+                            Pull::Ended => {
+                                b_alive = false;
+                                break;
+                            }
+                            Pull::Stall(_) => {
                                 b_alive = false;
                                 break;
                             }
@@ -343,14 +398,46 @@ impl MixerSource {
                 g.current = g.incoming.take();
                 mixed = b;
                 a_alive = b_alive;
+            } else if a_stall.is_some() {
+                // Mid-play 403/stall: drop the dead decoder, ask for a
+                // re-resolve at the current position. Never auto-advance.
+                let _ = g.current.take();
+                g.finished = false;
+                if let Some(msg) = a_stall.as_ref() {
+                    eprintln!(
+                        "playback stall: {msg}; re-resolving, not advancing"
+                    );
+                }
+                self.recover.store(true, Ordering::SeqCst);
+                self.buffering.store(true, Ordering::Relaxed);
+                self.phase.store(4, Ordering::Relaxed);
+            } else if a_buf {
+                // Still the same track; just waiting on the downloader.
+                a_alive = true;
             } else if !frozen && g.current.take().is_some() {
                 g.finished = true;
             }
         }
 
-        if g.finished && g.incoming.is_none() && g.current.is_none() {
+        if a_buf || b_buf {
+            if !self.buffering.swap(true, Ordering::Relaxed) {
+                eprintln!("underrun: pausing clock, waiting on downloader");
+            }
+            let ph = self.phase.load(Ordering::Relaxed);
+            if ph == 1 {
+                self.phase.store(4, Ordering::Relaxed);
+            }
+        } else if a_alive && self.buffering.swap(false, Ordering::Relaxed) {
+            if self.phase.load(Ordering::Relaxed) == 4 {
+                self.phase.store(1, Ordering::Relaxed);
+            }
+            eprintln!("underrun: resumed, clock running");
+        }
+
+        if g.finished && g.incoming.is_none() && g.current.is_none() && a_stall.is_none() {
             self.ended.store(true, Ordering::Relaxed);
             self.phase.store(0, Ordering::Relaxed);
+            self.buffering.store(false, Ordering::Relaxed);
             g.frame = vec![0; ch];
             g.frame_i = 1;
             return Some(0);
@@ -362,7 +449,11 @@ impl MixerSource {
         for s in mixed.iter_mut() {
             *s = (*s as f32 * gain).round() as i16;
         }
-        if a_alive && !frozen {
+        // The mixer owns the position clock. Do not increment while
+        // buffering or paused — that was a source of "time runs, silence".
+        // AudioSource used to also increment, doubling the clock (and
+        // firing blend/end ~2× early, which skipped ahead).
+        if a_alive && !frozen && !a_buf {
             self.samples
                 .fetch_add(ch as u64, Ordering::Relaxed);
         }

@@ -7,6 +7,7 @@
     wheel = false,
     showTip = false,
     format = (v: number) => String(v),
+    buffered = 0,
     oninput,
     onchange,
     onpreview,
@@ -19,6 +20,8 @@
     wheel?: boolean;
     showTip?: boolean;
     format?: (v: number) => string;
+    /** Seconds (or same unit as max) already downloaded ahead. */
+    buffered?: number;
     oninput?: (v: number) => void;
     onchange?: (v: number) => void;
     onpreview?: (v: number | null) => void;
@@ -38,6 +41,10 @@
   });
   let tipPct = $derived(dragging || preview != null ? fillPct : hoverPct);
   let tipVal = $derived(preview ?? (hovering && max > 0 ? (hoverPct / 100) * max : shown));
+  let bufPct = $derived.by(() => {
+    if (!max || max <= 0 || !isFinite(max) || !buffered) return 0;
+    return Math.max(0, Math.min(100, (buffered / max) * 100));
+  });
 
   function atX(clientX: number): number {
     const r = root!.getBoundingClientRect();
@@ -145,6 +152,9 @@
   onkeydown={onKey}
 >
   <div class="sbar-track">
+    {#if bufPct > 0}
+      <div class="sbar-buf" style="width:{bufPct}%"></div>
+    {/if}
     <div class="sbar-fill" style="width:{fillPct}%"></div>
   </div>
   <div class="sbar-thumb" style="left:{fillPct}%"></div>

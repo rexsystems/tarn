@@ -12,6 +12,7 @@
     danger = false,
     disabled = false,
     title = '',
+    spinning = false,
     onclick,
     class: cls = '',
   }: {
@@ -26,15 +27,21 @@
     title?: string;
     onclick?: (e: MouseEvent) => void;
     class?: string;
+    spinning?: boolean;
   } = $props();
 </script>
 
 <button
   class="ibtn {btnSize === 'lg' ? 'lg' : ''} {btnSize === 'xl' ? 'xl' : ''} {on ? 'on' : ''} {danger ? 'danger' : ''} {cls}"
+  class:spinning
   {title}
   {disabled}
   {onclick}
   type="button"
 >
-  <Hi {icon} {altIcon} {showAlt} {size} />
+  {#if spinning}
+    <span class="ibtn-spin" aria-hidden="true"></span>
+  {:else}
+    <Hi {icon} {altIcon} {showAlt} {size} />
+  {/if}
 </button>

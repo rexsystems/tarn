@@ -969,6 +969,16 @@ impl Ytm {
         self.streams.lock().unwrap().remove(id);
     }
 
+    /// Drop a cached stream URL and any partial audio so the next play
+    /// re-resolves (used after a mid-play 403 or stall).
+    pub fn invalidate(&self, id: &str) {
+        self.evict_stream(id);
+        self.cache.forget(id);
+        // Drop unfinished bodies so a stale 403'd download isn't reused.
+        self.bodies.lock().unwrap().retain(|_, b| b.is_complete());
+        eprintln!("stream cache: invalidated {id}");
+    }
+
     /// Drop in-memory URL and in-flight body caches (tests / cold play).
     pub fn drop_url_cache(&self) {
         self.streams.lock().unwrap().clear();
@@ -1620,6 +1630,37 @@ fn is_eof_error(e: &anyhow::Error) -> bool {
     e.to_string().contains("416") || e.to_string().contains("audio eof")
 }
 
+fn inject_403_at(offset: u64) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Ok(at) = std::env::var("TARN_INJECT_403_AT") else {
+        return false;
+    };
+    let Ok(at) = at.parse::<u64>() else {
+        return false;
+    };
+    if offset >= at && !DONE.swap(true, Ordering::SeqCst) {
+        eprintln!("audio: injecting 403 at offset {offset} (TARN_INJECT_403_AT={at})");
+        true
+    } else {
+        false
+    }
+}
+
+async fn throttle_download(n: usize) {
+    let Ok(bps) = std::env::var("TARN_DOWNLOAD_THROTTLE_BPS") else {
+        return;
+    };
+    let Ok(bps) = bps.parse::<u64>() else {
+        return;
+    };
+    if bps == 0 || n == 0 {
+        return;
+    }
+    let ms = (n as u64).saturating_mul(1000).saturating_div(bps).max(1);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
 async fn download_chunk(
     client: &reqwest::Client,
     stream: &Stream,
@@ -1639,6 +1680,9 @@ async fn download_chunk(
     req = req.header("User-Agent", ua);
     // Closed range only — `bytes=N-` 403s on iOS/TV googlevideo URLs.
     req = req.header("Range", format!("bytes={offset}-{end}"));
+    if inject_403_at(offset) {
+        return Err(anyhow!("audio download: HTTP 403 Forbidden"));
+    }
     let resp = req.send().await.context("audio download")?;
     let status = resp.status();
     if status.as_u16() == 416 {
@@ -1675,6 +1719,7 @@ async fn download_chunk(
         if let Some((cache, id)) = cache {
             let _ = cache.append_part(id, &chunk);
         }
+        throttle_download(chunk.len()).await;
     }
     if n == 0 && body.content_len().is_some_and(|t| body.len() as u64 >= t) {
         return Err(anyhow!("audio eof"));
