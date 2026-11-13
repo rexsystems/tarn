@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tarn — a YouTube Music desktop client</title>
+  <meta name="description" content="Tarn is a fast, self-contained YouTube Music app for Linux, Windows, and macOS. Free and open source." />
+  <link rel="icon" href="favicon.png" type="image/png" />
+  <meta property="og:title" content="Tarn" />
+  <meta property="og:description" content="A fast YouTube Music desktop client." />
+  <meta property="og:image" content="logo.png" />
+  <style>
+    :root {
+      --bg: #0c0b0a;
+      --bg-elev: #181715;
+      --bg-side: #11110f;
+      --text: #f5f3f0;
+      --text-2: #c9c6c0;
+      --text-3: #9a9791;
+      --accent: #e0a45a;
+      --line: rgba(255,255,255,0.08);
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+    body {
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { width: min(1080px, calc(100% - 48px)); margin: 0 auto; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 22px 0;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; color: var(--text); font-weight: 700; font-size: 18px; text-decoration: none; }
+    .brand img { width: 36px; height: 36px; border-radius: 9px; }
+    nav { display: flex; gap: 22px; font-size: 14px; font-weight: 550; }
+    nav a { color: var(--text-2); }
+    nav a:hover { color: var(--text); text-decoration: none; }
+    .hero { padding: 56px 0 36px; text-align: center; }
+    .hero h1 {
+      font-size: clamp(36px, 6vw, 64px);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      font-weight: 750;
+      margin: 0 0 16px;
+    }
+    .hero p {
+      font-size: 18px;
+      line-height: 1.5;
+      color: var(--text-2);
+      max-width: 540px;
+      margin: 0 auto 32px;
+    }
+    .cta { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0 20px;
+      border-radius: 22px;
+      font-weight: 650;
+      font-size: 15px;
+      text-decoration: none;
+      border: 1px solid transparent;
+    }
+    .btn:hover { text-decoration: none; filter: brightness(1.07); }
+    .btn-p { background: var(--accent); color: #1a1208; }
+    .btn-g { background: transparent; color: var(--text); border-color: var(--line); }
+    .btn-g:hover { background: rgba(255,255,255,0.05); }
+    .shots { padding: 12px 0 56px; display: grid; gap: 20px; }
+    .shots img {
+      width: 100%;
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.45);
+      background: var(--bg-side);
+    }
+    .grid-2 { display: grid; grid-template-columns: 1.3fr 0.9fr; gap: 20px; }
+    @media (max-width: 780px) { .grid-2 { grid-template-columns: 1fr; } }
+    .points {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      padding: 8px 0 72px;
+    }
+    @media (max-width: 780px) { .points { grid-template-columns: 1fr; } }
+    .pt {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 22px 22px 20px;
+    }
+    .pt h3 { margin: 0 0 8px; font-size: 16px; font-weight: 700; }
+    .pt p { margin: 0; color: var(--text-2); font-size: 14px; line-height: 1.5; }
+    footer {
+      border-top: 1px solid var(--line);
+      padding: 28px 0 48px;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      color: var(--text-3);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="./">
+        <img src="logo.png" alt="" width="36" height="36" />
+        Tarn
+      </a>
+      <nav>
+        <a href="https://github.com/rexsystems/tarn">Source</a>
+        <a href="https://github.com/rexsystems/tarn/releases">Releases</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <h1>YouTube Music,<br>on your desktop.</h1>
+      <p>Tarn is a fast, self-contained player for Linux, Windows, and macOS. Sign in with Google if you want — it works without an account too.</p>
+      <div class="cta">
+        <a class="btn btn-p" href="https://github.com/rexsystems/tarn/releases/latest">Download Tarn</a>
+        <a class="btn btn-g" href="https://github.com/rexsystems/tarn">View the source</a>
+      </div>
+    </section>
+
+    <section class="shots">
+      <img src="home.png" alt="Tarn home screen, with shelves of albums and a dark player bar" />
+      <div class="grid-2">
+        <img src="playing.png" alt="A track playing in Tarn, with queue and artwork" />
+        <img src="search.png" alt="Search suggestions, a top result, and songs in the Tarn search dropdown" />
+      </div>
+    </section>
+
+    <section class="points">
+      <div class="pt">
+        <h3>Nothing else to install</h3>
+        <p>Audio is decoded in-process. A current yt-dlp is bundled and kept up to date. You don't need ffmpeg or any other tool.</p>
+      </div>
+      <div class="pt">
+        <h3>Picks up where you left off</h3>
+        <p>Closing Tarn remembers the track and position, the queue, volume, shuffle and repeat, and the window itself.</p>
+      </div>
+      <div class="pt">
+        <h3>Free and open source</h3>
+        <p>Tarn is licensed under the GPL-3.0. Built with Tauri, Rust, and Svelte. Updates are signed and offered in the app.</p>
+      </div>
+    </section>
+
+    <footer>
+      <span>© Tarn. <a href="https://github.com/rexsystems/tarn/blob/main/LICENSE">GPL-3.0</a></span>
+      <span><a href="https://github.com/rexsystems/tarn">github.com/rexsystems/tarn</a></span>
+    </footer>
+  </div>
+</body>
+</html>
