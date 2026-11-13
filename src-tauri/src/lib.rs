@@ -35,6 +35,8 @@ pub struct App {
     auth: Mutex<AuthStatus>,
     notify: Mutex<bool>,
     pub ui: Mutex<persist::UiMem>,
+    pub pending_toast: Mutex<Option<String>>,
+    skip_fails: std::sync::atomic::AtomicU32,
 }
 
 impl App {
@@ -82,6 +84,8 @@ impl App {
             settings: Mutex::new(settings),
             auth: Mutex::new(auth),
             ui: Mutex::new(persist::UiMem::default()),
+            pending_toast: Mutex::new(None),
+            skip_fails: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -373,7 +377,7 @@ pub(crate) async fn start_playback_at(
         app.player.set_duration(d as f64);
     }
     app.player.set_rating(false, false);
-    app.player.prepare(track, queue.clone(), index, start, true);
+    app.player.prepare(track.clone(), queue.clone(), index, start, true);
 
     // Cover/accent is decorative — never block the play path on it.
     if let Some(url) = cover {
@@ -401,18 +405,63 @@ pub(crate) async fn start_playback_at(
                         .player
                         .play_stream(stream, audio, start, style)
                         .map_err(|e| e.to_string());
+                    if r.is_ok() {
+                        app.skip_fails.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                     prefetch_ahead(app, &queue, index);
                     r
                 }
                 Err(e) => {
                     let msg = short_err(&e.to_string());
-                    app.player.set_error(msg.clone());
-                    Err(msg)
+                    playback_failed(app, &track, msg, paused, start).await
                 }
             }
         }
         Err(e) => {
             let msg = short_err(&e.to_string());
+            playback_failed(app, &track, msg, paused, start).await
+        }
+    }
+}
+
+/// After every client and yt-dlp path has failed, skip to the next track
+/// with a subtle toast instead of leaving "Can't play this track" stuck
+/// on the current song. Stop after three consecutive skips.
+async fn playback_failed(
+    app: &App,
+    track: &Track,
+    msg: String,
+    paused: bool,
+    start: f64,
+) -> Result<(), String> {
+    // Don't walk the queue on a paused restore / mid-track recover.
+    if paused && start > 0.05 {
+        app.player.set_error(msg.clone());
+        return Err(msg);
+    }
+    let n = app
+        .skip_fails
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let title = track.title.clone();
+    let failed_id = track.id.clone();
+    eprintln!("playback failed ({n}): {msg} — {title}");
+    if n > 3 {
+        app.player.set_error(msg.clone());
+        return Err(msg);
+    }
+    *app.pending_toast.lock() = Some(format!("Couldn't play {title}, skipping"));
+    match Box::pin(advance(app, false)).await {
+        Ok(()) => {
+            let still = app.player.snapshot();
+            if still.track.as_ref().is_some_and(|t| t.id == failed_id) {
+                app.player.set_error(msg.clone());
+                Err(msg)
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => {
             app.player.set_error(msg.clone());
             Err(msg)
         }
@@ -987,6 +1036,9 @@ fn emit_loop(handle: AppHandle, app: Arc<App>) {
                     let _ = advance(&app2, false).await;
                     let _ = handle2.emit("player", app2.player.snapshot());
                 });
+            }
+            if let Some(msg) = app.pending_toast.lock().take() {
+                let _ = handle.emit("toast", msg);
             }
             let st = app.player.snapshot();
             let _ = handle.emit("player", st);

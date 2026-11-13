@@ -240,11 +240,46 @@ async fn download_official(dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = dest.with_extension("download");
+    // Keep the original filename + ".download" so Windows `yt-dlp.exe`
+    // becomes `yt-dlp.exe.download`, not `yt-dlp.download`.
+    let tmp = dest.with_file_name(format!(
+        "{}.download",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
     std::fs::write(&tmp, &bytes)?;
     make_executable(&tmp);
-    std::fs::rename(&tmp, dest)?;
+    replace_file(&tmp, dest)?;
     Ok(())
+}
+
+/// Atomically put `tmp` at `dest`. On Windows the destination exe is often
+/// locked (the previous yt-dlp is still running), so we move it aside first.
+fn replace_file(tmp: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() && cfg!(windows) {
+        let bak = dest.with_file_name(format!(
+            "{}.old",
+            dest.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&bak);
+        if let Err(e) = std::fs::rename(dest, &bak) {
+            eprintln!("yt-dlp: could not move old binary aside: {e}");
+        }
+        match std::fs::rename(tmp, dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&bak);
+                Ok(())
+            }
+            Err(e) => {
+                // Put the old one back if the swap failed.
+                if bak.exists() && !dest.exists() {
+                    let _ = std::fs::rename(&bak, dest);
+                }
+                Err(e.into())
+            }
+        }
+    } else {
+        std::fs::rename(tmp, dest).map_err(Into::into)
+    }
 }
 
 fn seed_from_sidecar(dest: &Path) -> Result<bool> {
@@ -282,9 +317,13 @@ pub async fn ensure() -> Result<PathBuf> {
     }
 }
 
-/// Copy the sidecar into the data dir (so it can be written) and run official
-/// `yt-dlp -U`. Safe to fire-and-forget at startup. Never touches a read-only
-/// bundled copy in place.
+/// Refresh the writable yt-dlp in the app data dir from the official
+/// GitHub release. Safe to fire-and-forget at startup.
+///
+/// We download to a temp file and rename over the destination. Official
+/// `yt-dlp -U` tries to overwrite itself in place, which fails on Windows
+/// (the file is locked, or the bundled sidecar is read-only) and is a
+/// common cause of a stale extractor.
 pub async fn maybe_update() {
     if cfg!(any(target_os = "android", target_os = "ios")) {
         return;
@@ -293,33 +332,48 @@ pub async fn maybe_update() {
         return;
     }
     let dest = data_bin_dir().join(binary_name());
-    let ready = is_usable(&dest)
-        || seed_from_sidecar(&dest).unwrap_or(false)
-        || download_official(&dest).await.is_ok();
-    if !ready || !is_usable(&dest) {
-        return;
+    if !is_usable(&dest) {
+        let _ = seed_from_sidecar(&dest);
     }
-    let mut upd = tokio::process::Command::new(&dest);
-    silence_tokio(&mut upd);
-    match upd
-        .arg("-U")
-        .arg("--no-warnings")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-    {
-        Ok(out) => {
-            let msg = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let line = msg
-                .lines()
-                .chain(stdout.lines())
-                .last()
-                .unwrap_or("updated");
-            eprintln!("yt-dlp update: {line}");
+    let before = version(&dest);
+    match download_official(&dest).await {
+        Ok(()) => {
+            let after = version(&dest);
+            eprintln!(
+                "yt-dlp update: {} -> {}",
+                before.as_deref().unwrap_or("none"),
+                after.as_deref().unwrap_or("?")
+            );
         }
-        Err(e) => eprintln!("yt-dlp update: {e}"),
+        Err(e) => {
+            eprintln!("yt-dlp update (download): {e}");
+            // Last resort: `yt-dlp -U` on a writable copy. May fail on
+            // Windows if the exe is locked; we already tried a replace.
+            if is_usable(&dest) {
+                let mut upd = tokio::process::Command::new(&dest);
+                silence_tokio(&mut upd);
+                match upd
+                    .arg("-U")
+                    .arg("--no-warnings")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(out) => {
+                        let msg = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let line = msg
+                            .lines()
+                            .chain(stdout.lines())
+                            .last()
+                            .unwrap_or("updated");
+                        eprintln!("yt-dlp update (-U): {line}");
+                    }
+                    Err(e) => eprintln!("yt-dlp update (-U): {e}"),
+                }
+            }
+        }
     }
     touch_last_check();
 }

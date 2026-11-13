@@ -712,7 +712,7 @@ impl Ytm {
             .music_playlist(id)
             .await
             .map_err(|e| anyhow!("{e}"))?;
-        Ok(Collection {
+        let mut c = Collection {
             kind: "playlist".into(),
             id: p.id,
             playlist_id: None,
@@ -729,7 +729,45 @@ impl Ytm {
             related: p.related_playlists.items.iter().map(playlist_from).collect(),
             owned: false,
             saved: false,
-        })
+        };
+        // rustypipe often leaves playlist album columns empty. Fill them
+        // from the InnerTube browse (third flex column) when missing.
+        if c.tracks.iter().any(|t| t.album.is_none()) {
+            if let Err(e) = self.fill_playlist_albums(&mut c).await {
+                eprintln!("playlist albums: {e}");
+            }
+        }
+        Ok(c)
+    }
+
+    async fn fill_playlist_albums(&self, c: &mut Collection) -> Result<()> {
+        let browse_id = if c.id.starts_with("VL") {
+            c.id.clone()
+        } else {
+            format!("VL{}", c.id)
+        };
+        let it = InnerTube::new(
+            self.http.clone(),
+            self.cookie.lock().unwrap().clone(),
+            self.lang.lock().unwrap().clone(),
+            self.country.lock().unwrap().clone(),
+        );
+        let body = it.browse(&browse_id, None).await?;
+        let albums = innertube::albums_from_browse(&body);
+        if albums.is_empty() {
+            return Ok(());
+        }
+        for t in &mut c.tracks {
+            if t.album.is_none() {
+                if let Some((name, aid)) = albums.get(&t.id) {
+                    t.album = Some(name.clone());
+                    if t.album_id.is_none() {
+                        t.album_id = aid.clone();
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn radio(&self, video_id: &str) -> Result<Vec<Track>> {
@@ -1160,13 +1198,18 @@ impl Ytm {
         let body2 = body.clone();
         let cache = self.cache.clone();
         let id = video_id.to_string();
+        let rp = self.rp.clone();
+        let cookies_file = self.cookies_file.clone();
+        let quality = self.quality();
         tokio::spawn(async move {
             let c = if id.is_empty() {
                 None
             } else {
-                Some((cache, id))
+                Some((cache, id.clone()))
             };
-            if let Err(e) = download_into(&stream, &body2, c).await {
+            if let Err(e) =
+                download_into(&stream, &body2, c, &rp, &id, &cookies_file, &quality).await
+            {
                 body2.fail(e.to_string());
             } else {
                 body2.finish();
@@ -1215,6 +1258,10 @@ impl Stream {
         } else {
             format!("{}-{}", self.source, self.client)
         }
+    }
+
+    pub fn itag(&self) -> Option<u64> {
+        url_query_u64(&self.url, "itag")
     }
 }
 
@@ -1534,25 +1581,30 @@ async fn download_into(
     stream: &Stream,
     body: &crate::decode::GrowingBody,
     cache: Option<(std::sync::Arc<crate::cache::AudioCache>, String)>,
+    rp: &RustyPipe,
+    video_id: &str,
+    cookies_file: &std::path::Path,
+    quality: &str,
 ) -> Result<()> {
-    // googlevideo 403s an open-ended `Range: bytes=N-` (and a request with
-    // no Range at all) on iOS/TV URLs. Closed ranges work. Download in
-    // chunks; the first chunk is sized so we hit READY_BYTES in one round.
-    const CHUNK: u64 = 256 * 1024;
+    // googlevideo 403s an open-ended `Range: bytes=N-` on iOS/TV URLs, and
+    // it also 403s a given URL after roughly four 256 KiB closed-range
+    // requests (~1 MiB). That left every song stuck at ~20% buffered.
+    // Start with a 256 KiB chunk so playback can begin quickly, then pull
+    // 2 MiB at a time. On 403/410, re-resolve a fresh URL for the *same
+    // itag* and resume from the last byte — never splice a different format.
+    const FIRST: u64 = 256 * 1024;
+    const CHUNK: u64 = 2 * 1024 * 1024;
     if let Some(n) = url_query_u64(&stream.url, "clen") {
         body.set_content_len(n);
     }
-    let ua = stream_ua(stream);
-    let client = reqwest::Client::builder()
-        .user_agent(&ua)
-        .http1_only()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(60))
-        .build()?;
-
+    let mut stream = stream.clone();
+    let mut client = download_client(&stream)?;
+    let mut ua = stream_ua(&stream);
     let mut stale_tries = 0u32;
     let mut net_tries = 0u32;
+    let mut same_client_hits = 0u32;
+    let mut last_log = 0u64;
+
     loop {
         let offset = body.len() as u64;
         if let Some(total) = body.content_len() {
@@ -1560,45 +1612,131 @@ async fn download_into(
                 break;
             }
         }
+        let want = if offset == 0 { FIRST } else { CHUNK };
         let end = match body.content_len() {
-            Some(total) => (offset + CHUNK - 1).min(total.saturating_sub(1)),
-            None => offset + CHUNK - 1,
+            Some(total) => (offset + want - 1).min(total.saturating_sub(1)),
+            None => offset + want - 1,
         };
         if end < offset {
             break;
         }
-        match download_chunk(&client, stream, &ua, body, offset, end, cache.as_ref()).await {
+        match download_chunk(&client, &stream, &ua, body, offset, end, cache.as_ref()).await {
             Ok(()) => {
                 stale_tries = 0;
                 net_tries = 0;
+                same_client_hits = 0;
                 if let Some((cache, id)) = &cache {
                     let _ = cache.write_part(id, &body.snapshot());
                 }
-                // If the server gave us no total and returned a short
-                // chunk, we may be done — handled inside download_chunk
-                // via 416 or a short body with no content-len.
-                if body.content_len().is_none() {
-                    // Got a full (non-partial) response: that's the file.
-                    // download_chunk sets content_len from Content-Range
-                    // when present. If still none, one more loop will
-                    // 416 or 403; treat a short read as EOF below.
+                let got = body.len() as u64;
+                if got >= last_log + 256 * 1024 || body.content_len() == Some(got) {
+                    let pct = body
+                        .content_len()
+                        .map(|c| format!(" {:.0}%", 100.0 * got as f64 / c as f64))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "audio: {got} / {:?} bytes{pct} via {}",
+                        body.content_len(),
+                        stream.label()
+                    );
+                    last_log = got;
                 }
             }
-            Err(e) if is_eof_error(&e) => break,
-            Err(e) if is_freshness_error(&e) => {
-                stale_tries += 1;
-                if stale_tries > 4 {
-                    return Err(e);
+            Err(e) if is_eof_error(&e) => {
+                // A 416 is only a real end if we already have the declared
+                // length, or we have no length and some audio. A 416 mid-file
+                // is a stale URL — re-resolve and resume.
+                if body.content_len().is_some_and(|t| body.len() as u64 >= t) {
+                    break;
+                }
+                if body.content_len().is_none() && body.len() >= 64 {
+                    eprintln!(
+                        "audio: 416 with no content-length at {}; treating as end",
+                        body.len()
+                    );
+                    break;
                 }
                 eprintln!(
-                    "audio chunk {}-{}: {e}; retrying ({stale_tries})",
+                    "audio: unexpected 416 at {} / {:?}; re-resolving",
+                    offset,
+                    body.content_len()
+                );
+                match reresolve_from(
+                    rp,
+                    video_id,
+                    &stream,
+                    cookies_file,
+                    quality,
+                    false,
+                )
+                .await
+                {
+                    Ok(next) => {
+                        stream = next;
+                        ua = stream_ua(&stream);
+                        client = download_client(&stream)?;
+                        stale_tries = 0;
+                    }
+                    Err(e2) => {
+                        eprintln!("audio: re-resolve after 416 failed: {e2}");
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) if is_freshness_error(&e) => {
+                stale_tries += 1;
+                same_client_hits += 1;
+                eprintln!(
+                    "audio chunk {}-{}: {e}; re-resolving from byte {offset} ({stale_tries})",
                     offset, end
                 );
-                tokio::time::sleep(Duration::from_millis(250 * stale_tries as u64)).await;
+                body.touch();
+                match reresolve_from(
+                    rp,
+                    video_id,
+                    &stream,
+                    cookies_file,
+                    quality,
+                    same_client_hits >= 2,
+                )
+                .await
+                {
+                    Ok(next) => {
+                        stream = next;
+                        ua = stream_ua(&stream);
+                        client = download_client(&stream)?;
+                        stale_tries = 0;
+                        net_tries = 0;
+                    }
+                    Err(e2) => {
+                        if stale_tries > 8 {
+                            return Err(e);
+                        }
+                        eprintln!("audio: re-resolve failed: {e2}; retrying");
+                        tokio::time::sleep(Duration::from_millis(300 * stale_tries as u64)).await;
+                    }
+                }
             }
             Err(e) => {
                 net_tries += 1;
-                if net_tries > 4 {
+                if net_tries > 6 {
+                    // One last try: fresh URL, then give up.
+                    if let Ok(next) = reresolve_from(
+                        rp,
+                        video_id,
+                        &stream,
+                        cookies_file,
+                        quality,
+                        true,
+                    )
+                    .await
+                    {
+                        stream = next;
+                        ua = stream_ua(&stream);
+                        client = download_client(&stream)?;
+                        net_tries = 0;
+                        continue;
+                    }
                     return Err(e);
                 }
                 let wait = Duration::from_millis(400 * (1u64 << (net_tries - 1).min(4)));
@@ -1612,6 +1750,14 @@ async fn download_into(
     if body.len() < 64 {
         return Err(anyhow!("audio download too small ({} bytes)", body.len()));
     }
+    if let Some(total) = body.content_len() {
+        if (body.len() as u64) < total.saturating_sub(1024) {
+            return Err(anyhow!(
+                "audio download short: {} of {total} bytes",
+                body.len()
+            ));
+        }
+    }
     if let Some((cache, id)) = &cache {
         if let Err(e) = cache.commit(id, &body.snapshot()) {
             eprintln!("cache commit: {e}");
@@ -1624,6 +1770,152 @@ async fn download_into(
         stream.mime.as_deref().unwrap_or("?")
     );
     Ok(())
+}
+
+fn download_client(stream: &Stream) -> Result<reqwest::Client> {
+    let ua = stream_ua(stream);
+    reqwest::Client::builder()
+        .user_agent(&ua)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(Into::into)
+}
+
+async fn reresolve_from(
+    rp: &RustyPipe,
+    video_id: &str,
+    current: &Stream,
+    cookies_file: &std::path::Path,
+    quality: &str,
+    skip_same: bool,
+) -> Result<Stream> {
+    if video_id.is_empty() {
+        return Err(anyhow!("cannot re-resolve an empty id"));
+    }
+    let want = current.itag();
+    // Fast path: the same rustypipe client that already worked. A mid-file
+    // 403 is a stale URL, not a bad client — don't walk every client
+    // (and wait 20–30s) before we can resume.
+    // After a couple of fresh same-client URLs also 403 at this offset,
+    // skip straight to yt-dlp — looping ios for a minute just stalls
+    // the buffer.
+    if !skip_same {
+    if let Some(ctype) = client_type_of(current.client) {
+        match rustypipe_one(rp, video_id, ctype).await {
+            Ok(s) if itag_ok(want, s.itag()) => {
+                eprintln!(
+                    "audio: re-resolved {} itag={:?} (was {:?})",
+                    s.label(),
+                    s.itag(),
+                    want
+                );
+                return Ok(s);
+            }
+            Ok(s) => eprintln!(
+                "audio: same-client {} itag {:?} != {:?}",
+                s.label(),
+                s.itag(),
+                want
+            ),
+            Err(e) => eprintln!("audio: same-client re-resolve: {e}"),
+        }
+    }
+    } else {
+        eprintln!("audio: skipping same-client re-resolve after repeated 403s");
+    }
+    // yt-dlp next — usually a couple of seconds, faster than probing
+    // every rustypipe client with a first-chunk.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let cookies = if cookies_file.exists() {
+            Some(cookies_file.to_path_buf())
+        } else {
+            None
+        };
+        match ytdlp_stream(video_id, cookies.as_deref(), quality).await {
+            Ok(s) if itag_ok(want, s.itag()) || want.is_none() => {
+                eprintln!("audio: re-resolved yt-dlp itag={:?}", s.itag());
+                return Ok(s);
+            }
+            Ok(s) => {
+                eprintln!(
+                    "audio: yt-dlp itag {:?} != {:?}; refusing to splice",
+                    s.itag(),
+                    want
+                );
+            }
+            Err(e) => eprintln!("audio: yt-dlp re-resolve: {e}"),
+        }
+    }
+    // Last resort: every remaining rustypipe client.
+    let skip: Vec<&str> = vec![current.client];
+    match rustypipe_stream(rp, video_id, &skip).await {
+        Ok(s) if itag_ok(want, s.itag()) => {
+            eprintln!(
+                "audio: re-resolved {} itag={:?} (was {:?})",
+                s.label(),
+                s.itag(),
+                want
+            );
+            return Ok(s);
+        }
+        Ok(s) => eprintln!(
+            "audio: re-resolved {} but itag {:?} != {:?}",
+            s.label(),
+            s.itag(),
+            want
+        ),
+        Err(e) => eprintln!("audio: rustypipe re-resolve: {e}"),
+    }
+    Err(anyhow!("no fresh stream with itag {want:?}"))
+}
+
+fn client_type_of(name: &str) -> Option<ClientType> {
+    Some(match name {
+        "ios" => ClientType::Ios,
+        "tv" => ClientType::Tv,
+        "android" => ClientType::Android,
+        "web-music" | "web_music" => ClientType::DesktopMusic,
+        "web" | "desktop" => ClientType::Desktop,
+        "mobile" => ClientType::Mobile,
+        _ => return None,
+    })
+}
+
+async fn rustypipe_one(rp: &RustyPipe, id: &str, ctype: ClientType) -> Result<Stream> {
+    let mut result = rp.query().player_from_clients(id, &[ctype]).await;
+    if result.is_err() {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        result = rp.query().player_from_clients(id, &[ctype]).await;
+    }
+    let player = result.map_err(|e| anyhow!("{e}"))?;
+    let used = player.client_type;
+    let used_name = client_name(used);
+    let audio = pick_audio(&player.audio_streams)
+        .ok_or_else(|| anyhow!("no audio streams (client={used_name})"))?;
+    let stream = Stream {
+        url: audio.url.clone(),
+        headers: headers_for(rp, used),
+        duration: audio.duration_ms.map(|ms| ms as f64 / 1000.0),
+        source: "rustypipe",
+        mime: Some(audio.mime.clone()),
+        client: used_name,
+        expire: url_expire(&audio.url),
+    };
+    probe_stream(&stream).await?;
+    Ok(stream)
+}
+
+fn itag_ok(want: Option<u64>, got: Option<u64>) -> bool {
+    match (want, got) {
+        (Some(a), Some(b)) => a == b,
+        // If either side has no itag, allow — YouTube m4a is almost
+        // always itag 140, and a missing param is better than giving up.
+        _ => true,
+    }
 }
 
 fn is_eof_error(e: &anyhow::Error) -> bool {
@@ -1702,13 +1994,23 @@ async fn download_chunk(
             // "bytes 0-1023/2975815"
             if let Some(total) = s.rsplit('/').next() {
                 if let Ok(n) = total.parse::<u64>() {
-                    body.set_content_len(n);
+                    // Never shrink a known length — a short 206 must
+                    // not convince us the file is only one chunk long.
+                    if body.content_len().unwrap_or(0) < n {
+                        body.set_content_len(n);
+                    }
                 }
             }
         }
     } else if status.as_u16() == 200 {
+        // A 200 (Range ignored) is the rest of the file from `offset`.
+        // Do not treat the first chunk's Content-Length as the whole file
+        // if we already know a larger clen.
         if let Some(len) = resp.content_length() {
-            body.set_content_len(len.saturating_add(offset));
+            let total = len.saturating_add(offset);
+            if body.content_len().unwrap_or(0) < total {
+                body.set_content_len(total);
+            }
         }
     }
     let mut n = 0usize;
@@ -1811,16 +2113,30 @@ fn headers_for(rp: &RustyPipe, ctype: ClientType) -> Vec<(String, String)> {
 
 async fn rustypipe_stream(rp: &RustyPipe, id: &str, skip: &[&str]) -> Result<Stream> {
     // iOS and TV return unobfuscated URLs and do not need a PO token.
-    // Android is a useful extra fallback. Each is requested separately so a
-    // URL that 403s under its own UA can be skipped without giving up.
-    let order = [ClientType::Ios, ClientType::Tv, ClientType::Android];
+    // Then Android, web_music, web, and mobile. Each is requested
+    // separately, and once more on a transient failure, so we only
+    // surface an error after every client has been tried.
+    let order = [
+        ClientType::Ios,
+        ClientType::Tv,
+        ClientType::Android,
+        ClientType::DesktopMusic,
+        ClientType::Desktop,
+        ClientType::Mobile,
+    ];
     let mut last = None;
     for ctype in order {
         let name = client_name(ctype);
         if skip.contains(&name) {
             continue;
         }
-        match rp.query().player_from_clients(id, &[ctype]).await {
+        let mut result = rp.query().player_from_clients(id, &[ctype]).await;
+        if result.is_err() {
+            // One retry — Innertube flakes.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            result = rp.query().player_from_clients(id, &[ctype]).await;
+        }
+        match result {
             Ok(player) => {
                 let used = player.client_type;
                 let used_name = client_name(used);
@@ -1908,33 +2224,70 @@ async fn ytdlp_stream(
         .await
         .context("yt-dlp sidecar is not available")?;
     let url = format!("https://www.youtube.com/watch?v={id}");
-    let mut cmd = Command::new(&bin);
-    crate::ytdlp::silence_tokio(&mut cmd);
-    cmd.arg("--no-warnings")
-        .arg("--no-playlist")
-        .arg("-f")
-        .arg(format_for(quality));
-        // Let yt-dlp pick a working player client. Pinning ios/tv/android/web
-        // fails with "Requested format is not available" on current YouTube.
-    if let Some(p) = cookies {
-        cmd.arg("--cookies").arg(p);
+    // Try yt-dlp's own default first (it usually picks a working client).
+    // If that fails, walk a list of player_client sets — a stale default
+    // is a common reason songs intermittently won't play.
+    let sets: &[&str] = &[
+        "",
+        "ios",
+        "tv_embedded,tv",
+        "android",
+        "web_music",
+        "web_creator",
+        "mweb",
+        "ios,tv,android,web_music",
+    ];
+    let mut last_err = None;
+    let mut out = None;
+    for (i, set) in sets.iter().enumerate() {
+        let mut cmd = Command::new(&bin);
+        crate::ytdlp::silence_tokio(&mut cmd);
+        cmd.arg("--no-warnings")
+            .arg("--no-playlist")
+            .arg("-f")
+            .arg(format_for(quality));
+        if !set.is_empty() {
+            cmd.arg("--extractor-args")
+                .arg(format!("youtube:player_client={set}"));
+        }
+        if let Some(p) = cookies {
+            cmd.arg("--cookies").arg(p);
+        }
+        cmd.arg("-j").arg("--").arg(&url);
+        let o = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .with_context(|| format!("run yt-dlp at {}", bin.display()))?;
+        if o.status.success() {
+            if !set.is_empty() {
+                eprintln!("yt-dlp: ok with player_client={set}");
+            }
+            out = Some(o);
+            break;
+        }
+        let err = String::from_utf8_lossy(&o.stderr);
+        let line = err.lines().last().unwrap_or("failed").to_string();
+        eprintln!(
+            "yt-dlp: player_client={} failed (exit {:?}): {line}",
+            if set.is_empty() { "(default)" } else { set },
+            o.status.code()
+        );
+        last_err = Some(line);
+        if i + 1 < sets.len() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
-    cmd.arg("-j").arg("--").arg(&url);
-    let out = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .with_context(|| format!("run yt-dlp at {}", bin.display()))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "yt-dlp: {}",
-            String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .last()
-                .unwrap_or("failed")
-        ));
-    }
+    let out = match out {
+        Some(o) => o,
+        None => {
+            return Err(anyhow!(
+                "yt-dlp: {}",
+                last_err.unwrap_or_else(|| "failed".into())
+            ));
+        }
+    };
     let v: Value = serde_json::from_slice(&out.stdout).context("yt-dlp json")?;
     let stream_url = v
         .get("url")

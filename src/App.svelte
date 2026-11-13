@@ -9,6 +9,7 @@
   } from './lib/types';
   import { itemToTrack } from './lib/cover';
   import { artistsLine, fmtCount, fmtTime, shareUrl } from './lib/format';
+  import { paintAccent } from './lib/contrast';
   import Cover from './lib/components/Cover.svelte';
   import Hi from './lib/components/Hi.svelte';
   import IconBtn from './lib/components/IconBtn.svelte';
@@ -23,7 +24,7 @@
   import SearchBar from './lib/components/SearchBar.svelte';
   import Toast from './lib/components/Toast.svelte';
   import UpdatePrompt from './lib/components/UpdatePrompt.svelte';
-  import { fail, authPrompt } from './lib/toast';
+  import { fail, authPrompt, toast } from './lib/toast';
   import { friendlyError, isAuthError } from './lib/errors';
   import { localLikes, isLocalLiked, setLocalLiked, localRecents, recordRecent } from './lib/local';
   import {
@@ -101,9 +102,13 @@
   $effect(() => {
     if (player.accent) {
       const [r, g, b] = player.accent;
-      document.documentElement.style.setProperty('--accent-rgb', `${r}, ${g}, ${b}`);
-      document.documentElement.style.setProperty('--accent', `rgb(${r}, ${g}, ${b})`);
-      document.documentElement.style.setProperty('--accent-dim', `rgba(${r}, ${g}, ${b}, 0.18)`);
+      const paint = paintAccent(r, g, b);
+      const root = document.documentElement.style;
+      root.setProperty('--accent-rgb', paint.rgb);
+      root.setProperty('--accent', paint.css);
+      root.setProperty('--accent-dim', paint.dim);
+      root.setProperty('--accent-fg', paint.fg);
+      root.setProperty('--accent-fg-rgb', paint.fgRgb);
     }
   });
 
@@ -115,6 +120,9 @@
       recents = localRecents();
       try {
         player = await api.state();
+        unsubs.push(await listen<string>('toast', (e) => {
+          if (e.payload) toast(String(e.payload), 'info', 3600);
+        }));
         auth = await api.auth();
         settings = await api.settings();
       } catch {}

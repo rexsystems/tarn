@@ -164,6 +164,12 @@ impl GrowingBody {
         self.data.lock().unwrap().clone()
     }
 
+    /// Tell waiters the downloader is still alive (e.g. mid-file re-resolve)
+    /// so a quiet stretch is not treated as a dead download.
+    pub fn touch(&self) {
+        *self.last_progress.lock().unwrap() = Instant::now();
+    }
+
     pub fn request_urgent(&self, offset: u64) {
         self.urgent.store(offset, Ordering::Relaxed);
     }
@@ -340,18 +346,22 @@ impl Read for GrowingReader {
             }
             // Still growing: wait briefly, then tell the decoder this is
             // an underrun, not the end of the track.
+            //
+            // Do NOT turn a quiet stretch into a fatal TimedOut. Mid-file
+            // 403s take a re-resolve (often 15–40s) before the next byte
+            // arrives; a 12s stall here used to surface "Can't play this
+            // track" even though the downloader was still working and the
+            // rest of the file eventually arrived. Fatal Stall is only
+            // for `body.fail()` (the downloader itself gave up).
             self.body.buffering.store(true, Ordering::Relaxed);
             if self.body.last_progress.lock().unwrap().elapsed() >= STALL_AFTER {
                 eprintln!(
-                    "underrun: download stalled at {} / {:?} bytes (playhead {})",
+                    "underrun: waiting on downloader at {} / {:?} bytes (playhead {}), last progress {:?}",
                     avail,
                     self.body.content_len(),
-                    self.pos
+                    self.pos,
+                    self.body.last_progress.lock().unwrap().elapsed()
                 );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "audio download stalled",
-                ));
             }
             let (gg, t) = self.body.more.wait_timeout(g, UNDERRUN_WAIT).unwrap();
             g = gg;
@@ -446,6 +456,10 @@ pub struct AudioSource {
     leftover_pos: usize,
     sample_rate: u32,
     channels: u16,
+    /// Interleaved samples emitted, for a time estimate used on reseek.
+    pulled: u64,
+    reopens: u8,
+    len_at_packet: usize,
 }
 
 impl AudioSource {
@@ -496,6 +510,7 @@ impl AudioSource {
             ));
         }
 
+        let len_at_packet = body.len();
         Ok(Self {
             body,
             decoder,
@@ -505,6 +520,9 @@ impl AudioSource {
             leftover_pos: 0,
             sample_rate,
             channels,
+            pulled: 0,
+            reopens: 0,
+            len_at_packet,
         })
     }
 
@@ -568,6 +586,54 @@ impl AudioSource {
         Ok(())
     }
 
+    fn playhead(&self) -> f64 {
+        let den = self.sample_rate.max(1) as f64 * self.channels.max(1) as f64;
+        self.pulled as f64 / den
+    }
+
+    /// The ISO-MP4 demuxer, opened unseekable for progressive start, can
+    /// stop at a moof/mdat boundary even when later fragments are already
+    /// in the body ("Can't play" at ~0:41 with the buffer well ahead).
+    /// Reopen as seekable at the current time and continue.
+    fn should_reopen(&self, ended: bool) -> bool {
+        if self.reopens >= 8 {
+            return false;
+        }
+        let pos = self.playhead();
+        let dur = self.body.duration().unwrap_or(0.0);
+        let early = dur > 2.0 && pos + 1.5 < dur;
+        if ended {
+            // Demuxer said EOF well before the track's duration, or while
+            // the download is still going — almost certainly a fragment
+            // boundary, not the real end.
+            return early || !self.body.is_complete();
+        }
+        // Underrun only if many seconds of audio are already sitting in
+        // the body past the playhead (stuck demuxer, not a real wait).
+        let ahead = self.body.buffered_secs(dur);
+        ahead > pos + 8.0
+    }
+
+    fn reopen_at(&mut self, at: f64) -> Result<()> {
+        self.reopens = self.reopens.saturating_add(1);
+        eprintln!(
+            "decode: reseeking at {at:.2}s (reopen #{}, body {}/{:?})",
+            self.reopens,
+            self.body.len(),
+            self.body.content_len()
+        );
+        let pulled = self.pulled;
+        let reopens = self.reopens;
+        let mut fresh = AudioSource::open_seekable(self.body.clone(), true)?;
+        fresh.pulled = pulled;
+        fresh.reopens = reopens;
+        let _ = fresh.jump(at);
+        fresh.pulled = pulled;
+        fresh.reopens = reopens;
+        *self = fresh;
+        Ok(())
+    }
+
     fn fill(&mut self) -> Fill {
         match decode_next(
             &mut *self.format,
@@ -580,13 +646,50 @@ impl AudioSource {
                 self.leftover_pos = 0;
                 self.sample_rate = spec.rate;
                 self.channels = spec.channels.count() as u16;
+                self.len_at_packet = self.body.len();
                 Fill::Ok
             }
-            Ok(DecodeOut::Underrun) => Fill::Underrun,
-            Ok(DecodeOut::Ended) => Fill::Ended,
+            Ok(DecodeOut::Underrun) => {
+                if self.should_reopen(false) {
+                    match self.reopen_at(self.playhead()) {
+                        Ok(()) => Fill::Ok,
+                        Err(e) => {
+                            eprintln!("decode: reseek failed: {e}");
+                            Fill::Underrun
+                        }
+                    }
+                } else {
+                    Fill::Underrun
+                }
+            }
+            Ok(DecodeOut::Ended) => {
+                if self.should_reopen(true) {
+                    match self.reopen_at(self.playhead()) {
+                        Ok(()) => Fill::Ok,
+                        Err(e) => {
+                            eprintln!("decode: reseek-on-end failed: {e}");
+                            if self.body.is_complete() {
+                                Fill::Ended
+                            } else {
+                                Fill::Underrun
+                            }
+                        }
+                    }
+                } else {
+                    Fill::Ended
+                }
+            }
             Ok(DecodeOut::Stall(e)) => Fill::Stall(e),
             Err(e) => {
-                if self.body.is_complete() {
+                // Skip a bad packet / fragment by reseeking a fraction ahead.
+                if self.should_reopen(false) || self.reopens < 8 {
+                    let at = self.playhead() + 0.08;
+                    match self.reopen_at(at) {
+                        Ok(()) => return Fill::Ok,
+                        Err(e2) => eprintln!("decode: {e}; reseek: {e2}"),
+                    }
+                }
+                if self.body.is_complete() && !self.should_reopen(true) {
                     Fill::Ended
                 } else if let Some(err) = self.body.error() {
                     Fill::Stall(err)
@@ -606,6 +709,7 @@ impl AudioSource {
             if self.leftover_pos < self.leftover.len() {
                 let v = self.leftover[self.leftover_pos];
                 self.leftover_pos += 1;
+                self.pulled += 1;
                 return Pull::Sample(v);
             }
             match self.fill() {
@@ -667,7 +771,7 @@ fn decode_next(
             }
             Err(SymError::DecodeError(_)) => {
                 decode_errors += 1;
-                if decode_errors > 8 {
+                if decode_errors > 24 {
                     return Err(anyhow!("too many decode errors"));
                 }
                 continue;
@@ -686,9 +790,16 @@ fn classify_io(e: std::io::Error, body: &GrowingBody) -> DecodeOut {
     if e.kind() == std::io::ErrorKind::WouldBlock {
         return DecodeOut::Underrun;
     }
+    // A TimedOut from an older reader, or a quiet stretch (`is_stalled`),
+    // is just a long underrun while the downloader re-resolves. Only a
+    // recorded body.error (download gave up) is a real Stall.
     if e.kind() == std::io::ErrorKind::TimedOut || body.is_stalled() {
-        eprintln!("playback stall: {e} (downloaded {}/{:?})", body.len(), body.content_len());
-        return DecodeOut::Stall(e.to_string());
+        eprintln!(
+            "underrun: long wait at {}/{:?} ({e}); downloader still running",
+            body.len(),
+            body.content_len()
+        );
+        return DecodeOut::Underrun;
     }
     if body.is_complete() || (body.is_done() && body.error().is_none()) {
         return DecodeOut::Ended;

@@ -1085,3 +1085,38 @@ fn find_continuation(v: &Value) -> Option<String> {
 // Silence unused import warnings if PlaylistCard etc. unused
 #[allow(dead_code)]
 fn _unused(_: (Track, PlaylistCard, ArtistCard, Explore)) {}
+
+fn looks_like_duration(s: &str) -> bool {
+    let mut parts = s.split(':');
+    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !a.is_empty()
+        && a.chars().all(|c| c.is_ascii_digit())
+        && b.len() == 2
+        && b.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Video id → (album name, album browse id) from a playlist/album browse
+/// response. Playlist rows put the album in the third flex column.
+pub fn albums_from_browse(v: &Value) -> std::collections::HashMap<String, (String, Option<String>)> {
+    let mut out = std::collections::HashMap::new();
+    walk(v, &mut |key, val| {
+        if key == "musicResponsiveListItemRenderer" {
+            if let Some(item) = parse_responsive(val) {
+                if !item.id.is_empty() {
+                    if let Some(album) = item
+                        .album
+                        .filter(|a| !a.is_empty() && !looks_like_duration(a))
+                    {
+                        let aid = item
+                            .browse_id
+                            .filter(|b| b.starts_with("MPREb") || b.starts_with("OLAK"));
+                        out.entry(item.id).or_insert((album, aid));
+                    }
+                }
+            }
+        }
+    });
+    out
+}

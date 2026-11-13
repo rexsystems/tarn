@@ -22,6 +22,7 @@
   --text-2: #c9c6c0;
   --text-3: #9a9791;
   --accent: #e0a45a;
+  --accent-fg: #1a1208;
   --accent-rgb: 224, 164, 90;
   --accent-dim: rgba(224, 164, 90, 0.18);
   --danger: #e07a6e;
@@ -1483,7 +1484,7 @@ html { color-scheme: dark; }
 .chk.on .chk-box {
   background: var(--accent);
   border-color: var(--accent);
-  color: #1a1208;
+  color: var(--accent-fg, #1a1208);
 }
 .chk:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
 
@@ -1935,7 +1936,7 @@ html { color-scheme: dark; }
 .upd-later:hover { background: var(--bg-hover); color: var(--text); }
 .upd-go, .upd-check {
   background: var(--accent);
-  color: #1a1208;
+  color: var(--accent-fg, #1a1208);
 }
 .upd-go:hover, .upd-check:hover { filter: brightness(1.08); }
 .upd-go:disabled, .upd-later:disabled, .upd-check:disabled { opacity: 0.55; }
@@ -1954,17 +1955,31 @@ html { color-scheme: dark; }
   height: 100%;
 }
 
-/* Buffering spinner on the play button */
+/* Buffering spinner on the play button.
+   Use currentColor so the spinner always contrasts with the button
+   background (cream #f5f3f0 or accent). The old rule used
+   border-top-color: var(--text) on a button whose background is also
+   var(--text) — white-on-white, invisible. */
 .ibtn.spinning { position: relative; }
 .ibtn-spin {
   width: 18px;
   height: 18px;
-  border: 2px solid var(--line-2);
-  border-top-color: var(--text);
+  border: 2.5px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-top-color: currentColor;
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
 }
-.ibtn.xl .ibtn-spin { width: 22px; height: 22px; }
+.ibtn.xl {
+  /* ensure color stays dark even if a parent inherits accent-fg light */
+  color: #141312;
+}
+.ibtn.xl .ibtn-spin {
+  width: 22px;
+  height: 22px;
+  border-width: 3px;
+  border-color: rgba(20, 19, 18, 0.22);
+  border-top-color: #141312;
+}
 
 /* Fullscreen Now Playing: chrome auto-hides after idle */
 .np-close {
