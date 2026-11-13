@@ -37,6 +37,11 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev \
             librsvg2-dev patchelf libssl-dev pkg-config libdbus-1-dev \
             libasound2-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: fetch yt-dlp sidecar
+        run: node scripts/fetch-ytdlp.mjs
       - name: cargo check
         working-directory: src-tauri
         run: cargo check --all-targets
