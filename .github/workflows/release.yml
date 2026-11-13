@@ -27,7 +27,9 @@ jobs:
             args: --target aarch64-apple-darwin --bundles dmg
             os: macos
             rust_target: aarch64-apple-darwin
-          - platform: macos-13
+          # macos-13 was retired in Dec 2025. Cross-compile the Intel dmg
+          # from an Apple Silicon runner instead.
+          - platform: macos-latest
             args: --target x86_64-apple-darwin --bundles dmg
             os: macos
             rust_target: x86_64-apple-darwin
@@ -94,9 +96,17 @@ jobs:
             libasound2-dev
       - run: npm ci
       - name: init and build apk
-        env:
-          NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
+          # The Actions env context does not see the runner's ANDROID_NDK_HOME.
+          # Read it from the shell environment instead.
+          if [ -z "${NDK_HOME:-}" ]; then
+            export NDK_HOME="${ANDROID_NDK_HOME:-}"
+          fi
+          if [ -z "${NDK_HOME:-}" ] && [ -d "${ANDROID_SDK_ROOT:-}/ndk" ]; then
+            ver=$(ls -1 "$ANDROID_SDK_ROOT/ndk" | tail -1)
+            [ -n "$ver" ] && export NDK_HOME="$ANDROID_SDK_ROOT/ndk/$ver"
+          fi
+          echo "NDK_HOME=${NDK_HOME:-unset}"
           npx tauri android init --ci || npx tauri android init
           npx tauri android build --apk --debug
       - uses: actions/upload-artifact@v4
