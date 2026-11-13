@@ -960,14 +960,21 @@ fn cache_dir() -> PathBuf {
 }
 
 fn tighten_cache(dir: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_file() {
-                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
             }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
     }
 }
 

@@ -83,10 +83,11 @@ fn is_usable(p: &Path) -> bool {
     true
 }
 
-fn make_executable(p: &Path) {
+fn make_executable(_p: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let p = _p;
         if let Ok(m) = p.metadata() {
             let mut perms = m.permissions();
             perms.set_mode(perms.mode() | 0o755);

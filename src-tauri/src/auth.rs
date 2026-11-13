@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -195,9 +194,7 @@ impl SessionStore {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tarn");
         fs::create_dir_all(&data_dir)?;
-        let mut perms = fs::metadata(&data_dir)?.permissions();
-        perms.set_mode(0o700);
-        let _ = fs::set_permissions(&data_dir, perms);
+        restrict_mode(&data_dir, 0o700);
         Ok(Self { data_dir })
     }
 
@@ -301,6 +298,20 @@ pub enum StoreKind {
     EncryptedFile,
 }
 
+
+fn restrict_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(mode);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    let _ = mode;
+}
+
 fn atomic_write_0600(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -308,9 +319,7 @@ fn atomic_write_0600(path: &Path, data: &[u8]) -> Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    let mut perms = fs::metadata(&tmp)?.permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(&tmp, perms)?;
+    restrict_mode(&tmp, 0o600);
     fs::rename(&tmp, path)?;
     Ok(())
 }
