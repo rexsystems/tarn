@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
-use rodio::{OutputStream, Sink, Source};
+use rodio::{OutputStream, Sink};
 
 use crate::models::{PlayerState, Track};
 use crate::ytm::Stream;
@@ -12,6 +12,7 @@ use crate::ytm::Stream;
 /// Commands sent to the audio thread.
 enum Cmd {
     Play(Arc<crate::decode::GrowingBody>, f64),
+    Arm(Arc<crate::decode::GrowingBody>, f64),
     Crossfade(Arc<crate::decode::GrowingBody>, f64, f32),
     Gapless(Arc<crate::decode::GrowingBody>, f64),
     Cut(Arc<crate::decode::GrowingBody>, f64),
@@ -27,6 +28,8 @@ enum Cmd {
 pub enum PlayStyle {
     /// Fade in from silence (first track, or a hard start).
     Fresh,
+    /// Decode and sit paused at `start` (session restore).
+    Armed,
     /// Short equal-power dip when skipping.
     Cut,
     /// Equal-power overlap of `f32` seconds.
@@ -52,6 +55,8 @@ pub struct Player {
     xf_ms: Arc<AtomicU32>,
     album_cont: Arc<AtomicBool>,
     blending: Arc<AtomicBool>,
+    /// If the user hits play while a session is still arming.
+    want_play: Arc<AtomicBool>,
 }
 
 impl Player {
@@ -68,6 +73,7 @@ impl Player {
         let xf_ms = Arc::new(AtomicU32::new(4000));
         let album_cont = Arc::new(AtomicBool::new(true));
         let blending = Arc::new(AtomicBool::new(false));
+        let want_play = Arc::new(AtomicBool::new(false));
 
         let samples_t = samples.clone();
         let rate_t = sample_rate.clone();
@@ -97,6 +103,7 @@ impl Player {
             xf_ms,
             album_cont,
             blending,
+            want_play,
         }
     }
 
@@ -119,17 +126,37 @@ impl Player {
     }
 
     pub fn set_loading(&self, track: Track, queue: Vec<Track>, index: usize) {
+        self.prepare(track, queue, index, 0.0, true);
+    }
+
+    pub fn prepare(
+        &self,
+        track: Track,
+        queue: Vec<Track>,
+        index: usize,
+        position: f64,
+        loading: bool,
+    ) {
         self.ended.store(false, Ordering::Relaxed);
-        self.phase.store(3, Ordering::Relaxed);
+        self.phase
+            .store(if loading { 3 } else { 2 }, Ordering::Relaxed);
+        self.want_play.store(false, Ordering::Relaxed);
         let mut s = self.state.lock();
+        if let Some(d) = track.duration {
+            if d > 0 {
+                s.duration = d as f64;
+            }
+        }
         s.track = Some(track);
         s.queue = queue;
         s.index = index;
-        s.loading = true;
+        s.loading = loading;
         s.playing = false;
-        s.position = 0.0;
+        s.position = position.max(0.0);
         s.error = None;
     }
+
+
 
     pub fn set_accent(&self, rgb: Option<[u8; 3]>) {
         self.state.lock().accent = rgb;
@@ -170,6 +197,13 @@ impl Player {
         );
         let cmd = match style {
             PlayStyle::Fresh => Cmd::Play(audio, start),
+            PlayStyle::Armed => {
+                if self.want_play.load(Ordering::Relaxed) {
+                    Cmd::Play(audio, start)
+                } else {
+                    Cmd::Arm(audio, start)
+                }
+            }
             PlayStyle::Cut => Cmd::Cut(audio, start),
             PlayStyle::Crossfade(s) => Cmd::Crossfade(audio, start, s),
             PlayStyle::Gapless => Cmd::Gapless(audio, start),
@@ -179,7 +213,7 @@ impl Player {
             .map_err(|_| anyhow!("audio thread died"))?;
         // The blend itself is underway; clear the "due" latch so the next
         // track can be armed later. User-skip blending is already applied.
-        if matches!(style, PlayStyle::Cut | PlayStyle::Fresh) {
+        if matches!(style, PlayStyle::Cut | PlayStyle::Fresh | PlayStyle::Armed) {
             self.blending.store(false, Ordering::Relaxed);
         }
         Ok(())
@@ -272,6 +306,11 @@ impl Player {
         match self.phase.load(Ordering::Relaxed) {
             1 => self.pause(),
             2 => self.resume(),
+            3 => {
+                // Still arming a restored track — play as soon as it's ready.
+                let on = !self.want_play.load(Ordering::Relaxed);
+                self.want_play.store(on, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -468,6 +507,7 @@ pub enum NextChoice {
     Stop,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audio_thread(
     rx: std::sync::mpsc::Receiver<Cmd>,
     samples: Arc<AtomicU64>,
@@ -512,6 +552,23 @@ fn audio_thread(
                     }
                     Err(e) => {
                         eprintln!("decode: {e}");
+                        state.lock().error = Some("Can't play this track".into());
+                        phase.store(0, Ordering::Relaxed);
+                    }
+                }
+            }
+            Ok(Cmd::Arm(audio, start)) => {
+                match make_source(audio, start, samples.clone()) {
+                    Ok(src) => {
+                        let mut s = state.lock();
+                        s.position = start;
+                        s.loading = false;
+                        s.playing = false;
+                        drop(s);
+                        mix.arm(src);
+                    }
+                    Err(e) => {
+                        eprintln!("arm: {e}");
                         state.lock().error = Some("Can't play this track".into());
                         phase.store(0, Ordering::Relaxed);
                     }

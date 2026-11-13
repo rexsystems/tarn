@@ -89,6 +89,30 @@ impl Mixer {
         }
     }
 
+    /// Load a decoder at the given position and stay silent, paused.
+    /// Used when restoring a session so Play is instant.
+    pub fn arm(&self, src: AudioSource) {
+        let sr = src.sample_rate().max(1);
+        let ch = src.channels().max(1);
+        self.sample_rate.store(sr, Ordering::Relaxed);
+        self.channels.store(ch as u32, Ordering::Relaxed);
+        self.samples.store(0, Ordering::SeqCst);
+        self.ended.store(false, Ordering::Relaxed);
+        let mut g = self.inner.lock();
+        g.sr = sr;
+        g.ch = ch;
+        g.current = Some(src);
+        g.incoming = None;
+        g.xf_len = 0;
+        g.xf_pos = 0;
+        g.finished = false;
+        g.paused = true;
+        g.env = 0.0;
+        g.env_tgt = 0.0;
+        g.env_step = 0.0;
+        self.phase.store(2, Ordering::Relaxed);
+    }
+
     pub fn play(&self, src: AudioSource, fade_in: f32) {
         let sr = src.sample_rate().max(1);
         let ch = src.channels().max(1);
@@ -200,10 +224,6 @@ impl Mixer {
         self.inner.lock().set_fade(0.0, CLICK_FADE);
     }
 
-    pub fn is_crossfading(&self) -> bool {
-        let g = self.inner.lock();
-        g.xf_len > 0 && g.incoming.is_some()
-    }
 
     /// Queue `src` to start the instant the current decoder ends (no overlap,
     /// no silence). Used when crossfade is off, and within an album.

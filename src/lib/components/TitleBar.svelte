@@ -1,6 +1,20 @@
 <script lang="ts">
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { onMount } from 'svelte';
+  import Hi from './Hi.svelte';
+  import { ArrowLeft01Icon, ArrowRight01Icon } from '../icons';
+
+  let {
+    canBack = false,
+    canFwd = false,
+    onBack,
+    onFwd,
+  }: {
+    canBack?: boolean;
+    canFwd?: boolean;
+    onBack?: () => void;
+    onFwd?: () => void;
+  } = $props();
 
   const isMac =
     typeof navigator !== 'undefined' &&
@@ -30,6 +44,7 @@
   }
 </script>
 
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <header
   class="titlebar {isMac ? 'mac' : 'win'}"
   data-tauri-drag-region
@@ -37,9 +52,31 @@
 >
   {#if isMac}
     <div class="traffic-space" data-tauri-drag-region></div>
-    <div class="tb-title" data-tauri-drag-region>Tarn</div>
-  {:else}
-    <div class="tb-title" data-tauri-drag-region>Tarn</div>
+  {/if}
+  <div class="tb-nav">
+    <button
+      class="tb-nav-btn"
+      type="button"
+      title="Back"
+      aria-label="Back"
+      disabled={!canBack}
+      onclick={() => onBack?.()}
+    >
+      <Hi icon={ArrowLeft01Icon} size={16} />
+    </button>
+    <button
+      class="tb-nav-btn"
+      type="button"
+      title="Forward"
+      aria-label="Forward"
+      disabled={!canFwd}
+      onclick={() => onFwd?.()}
+    >
+      <Hi icon={ArrowRight01Icon} size={16} />
+    </button>
+  </div>
+  <div class="tb-title" data-tauri-drag-region>Tarn</div>
+  {#if !isMac}
     <div class="tb-btns">
       <button class="tb-btn min" type="button" title="Minimize" onclick={minimize} aria-label="Minimize">
         <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8" stroke="currentColor" stroke-width="1.15" fill="none"/></svg>

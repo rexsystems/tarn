@@ -67,6 +67,7 @@
             {#if showCover}
               <button class="cov" onclick={() => onPlay(t, i)} title="Play" type="button">
                 <Cover src={t.cover || fallbackCover} size={40} alt="" />
+                <span class="play-ov"><Hi icon={PlayIcon} size={16} /></span>
               </button>
             {/if}
             <div style="min-width:0">

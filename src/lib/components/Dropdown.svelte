@@ -85,7 +85,7 @@
   onMount(() => () => close());
 </script>
 
-<div class="dd {open ? 'open' : ''}" bind:this={root} onkeydown={onKey}>
+<div class="dd {open ? 'open' : ''}" bind:this={root}>
   <button
     class="dd-btn"
     type="button"
@@ -93,6 +93,7 @@
     aria-haspopup="listbox"
     aria-expanded={open}
     onclick={toggle}
+    onkeydown={onKey}
   >
     <span class="dd-val">{label}</span>
     <svg class="dd-caret" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
@@ -100,7 +101,7 @@
     </svg>
   </button>
   {#if open}
-    <ul class="dd-menu {align}" role="listbox" aria-activedescendant={active >= 0 ? `dd-${options[active]?.value}` : undefined}>
+    <ul class="dd-menu {align}" role="listbox" tabindex="-1" aria-activedescendant={active >= 0 ? `dd-${options[active]?.value}` : undefined}>
       {#each options as o, i}
         <li role="presentation">
           <button

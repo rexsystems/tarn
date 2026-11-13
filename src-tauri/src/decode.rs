@@ -81,6 +81,10 @@ impl GrowingBody {
         self.data.lock().unwrap().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::SeqCst)
     }

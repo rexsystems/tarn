@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module)]
 //! Session cookie storage and YouTube auth helpers.
 //! Cookie values are never written to logs.
 
@@ -178,9 +179,6 @@ pub fn sapisidhash_now(sapisid: &str) -> String {
     sapisidhash(sapisid, ORIGIN, ts)
 }
 
-pub fn music_origin() -> &'static str {
-    ORIGIN
-}
 
 /// Encrypted / keyring session store. Never logs cookie values.
 pub struct SessionStore {

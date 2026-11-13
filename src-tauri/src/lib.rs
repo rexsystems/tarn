@@ -7,6 +7,7 @@ mod login;
 mod mix;
 mod mpris;
 mod models;
+mod persist;
 pub mod player;
 pub mod ytdlp;
 pub mod ytm;
@@ -19,7 +20,7 @@ use models::{
 };
 use parking_lot::Mutex;
 use player::{NextChoice, Player};
-use tauri::{AppHandle, Emitter, Listener, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use ytm::Ytm;
 
 use crate::auth::SessionStore;
@@ -32,6 +33,7 @@ pub struct App {
     settings: Mutex<Settings>,
     auth: Mutex<AuthStatus>,
     notify: Mutex<bool>,
+    pub ui: Mutex<persist::UiMem>,
 }
 
 impl App {
@@ -62,6 +64,12 @@ impl App {
             settings.crossfade_seconds,
             settings.album_continuity,
         );
+        if let Some(sess) = persist::load(store.data_dir()) {
+            // Volume / shuffle / repeat / queue metadata — audio is armed later.
+            player.set_volume(sess.volume);
+            player.set_shuffle(sess.shuffle);
+            player.set_repeat(&sess.repeat);
+        }
         Ok(Self {
             ytm,
             player,
@@ -72,6 +80,7 @@ impl App {
             notify: Mutex::new(settings.notifications),
             settings: Mutex::new(settings),
             auth: Mutex::new(auth),
+            ui: Mutex::new(persist::UiMem::default()),
         })
     }
 
@@ -298,10 +307,23 @@ pub(crate) async fn start_playback(
     queue: Vec<Track>,
     index: usize,
 ) -> Result<(), String> {
+    start_playback_at(app, track, queue, index, 0.0, false).await
+}
+
+pub(crate) async fn start_playback_at(
+    app: &App,
+    track: Track,
+    queue: Vec<Track>,
+    index: usize,
+    start: f64,
+    paused: bool,
+) -> Result<(), String> {
     let id = track.id.clone();
     let cover = track.cover.clone();
     let snap = app.player.snapshot();
-    let style = if snap.playing && snap.track.is_some() {
+    let style = if paused {
+        crate::player::PlayStyle::Armed
+    } else if snap.playing && snap.track.is_some() {
         if app.player.should_crossfade(snap.track.as_ref(), &track) {
             crate::player::PlayStyle::Crossfade(app.player.crossfade_secs())
         } else {
@@ -314,7 +336,11 @@ pub(crate) async fn start_playback(
         app.player.set_duration(d as f64);
     }
     app.player.set_rating(false, false);
-    app.player.set_loading(track, queue.clone(), index);
+    if paused {
+        app.player.prepare(track, queue.clone(), index, start, true);
+    } else {
+        app.player.set_loading(track, queue.clone(), index);
+    }
 
     // Cover/accent is decorative — never block the play path on it.
     if let Some(url) = cover {
@@ -340,7 +366,7 @@ pub(crate) async fn start_playback(
                 Ok(audio) => {
                     let r = app
                         .player
-                        .play_stream(stream, audio, 0.0, style)
+                        .play_stream(stream, audio, start, style)
                         .map_err(|e| e.to_string());
                     prefetch_ahead(app, &queue, index);
                     r
@@ -357,6 +383,42 @@ pub(crate) async fn start_playback(
             app.player.set_error(msg.clone());
             Err(msg)
         }
+    }
+}
+
+
+async fn restore_playback(app: &App) {
+    let Some(sess) = persist::load(app.store.data_dir()) else {
+        return;
+    };
+    {
+        let mut ui = app.ui.lock();
+        if ui.view.is_none() {
+            *ui = persist::UiMem {
+                view: sess.view.clone(),
+                search_q: sess.search_q.clone(),
+                scroll: sess.scroll,
+            };
+        }
+    }
+    persist::apply_player_prefs(app, &sess);
+    if sess.queue.is_empty() {
+        return;
+    }
+    let idx = sess.index.min(sess.queue.len() - 1);
+    let track = sess.queue[idx].clone();
+    let queue = sess.queue.clone();
+    let pos = {
+        let dur = track.duration.map(|d| d as f64).unwrap_or(0.0);
+        let p = sess.position.max(0.0);
+        if dur > 1.0 {
+            p.min(dur - 0.4).max(0.0)
+        } else {
+            p
+        }
+    };
+    if let Err(e) = start_playback_at(app, track, queue, idx, pos, true).await {
+        eprintln!("restore playback: {e}");
     }
 }
 
@@ -401,12 +463,42 @@ async fn prefetch(app: State<'_, Arc<App>>, id: String) -> Result<(), String> {
 }
 
 fn short_err(s: &str) -> String {
+    friendly_err(s, "Can't play this track")
+}
+
+fn friendly_err(s: &str, fallback: &str) -> String {
     let s = s.trim();
-    if s.is_empty() || s.len() > 160 {
-        "Can't play this track".into()
-    } else {
-        s.to_string()
+    let low = s.to_lowercase();
+    if s.is_empty() {
+        return fallback.into();
     }
+    if low.contains("401") || low.contains("unauthorized") || low.contains("not logged") {
+        return "Sign in to continue".into();
+    }
+    if low.contains("403") || low.contains("forbidden") {
+        return "You don't have access to this.".into();
+    }
+    if low.contains("404") || low.contains("not found") {
+        return "We couldn't find that.".into();
+    }
+    if low.contains("timed out")
+        || low.contains("timeout")
+        || low.contains("connection")
+        || low.contains("network")
+        || low.contains("dns")
+    {
+        return "Can't reach YouTube right now.".into();
+    }
+    if low.contains("innertube")
+        || low.contains("http ")
+        || low.contains("status code")
+        || low.contains("reqwest")
+        || low.contains("os error")
+        || s.len() > 120
+    {
+        return fallback.into();
+    }
+    s.to_string()
 }
 
 #[tauri::command]
@@ -714,6 +806,31 @@ fn set_settings(app: State<Arc<App>>, settings: Settings) {
     *app.settings.lock() = settings;
 }
 
+
+#[tauri::command]
+fn remember_ui(app: State<Arc<App>>, ui: persist::UiMem) {
+    *app.ui.lock() = ui;
+}
+
+#[tauri::command]
+fn saved_session(app: State<Arc<App>>) -> Option<persist::SavedSession> {
+    let mut sess = persist::load(app.store.data_dir());
+    if let Some(s) = sess.as_mut() {
+        let ui = app.ui.lock();
+        if s.view.is_none() {
+            s.view = ui.view.clone();
+            s.search_q = ui.search_q.clone();
+            s.scroll = ui.scroll;
+        }
+    }
+    sess
+}
+
+#[tauri::command]
+fn save_session_now(handle: AppHandle) {
+    persist::save(&handle);
+}
+
 #[tauri::command]
 fn cache_stats(app: State<Arc<App>>) -> (u64, u64) {
     (app.ytm.cache.used_bytes(), app.ytm.cache.max_bytes())
@@ -786,6 +903,7 @@ fn maybe_blend(app: &Arc<App>) {
 
 fn emit_loop(handle: AppHandle, app: Arc<App>) {
     std::thread::spawn(move || {
+        let mut last_save = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             maybe_blend(&app);
@@ -799,6 +917,10 @@ fn emit_loop(handle: AppHandle, app: Arc<App>) {
             }
             let st = app.player.snapshot();
             let _ = handle.emit("player", st);
+            if last_save.elapsed() >= std::time::Duration::from_secs(3) {
+                persist::save(&handle);
+                last_save = std::time::Instant::now();
+            }
         }
     });
 }
@@ -823,9 +945,27 @@ pub fn run() {
         .setup(move |tauri_app| {
             let handle = tauri_app.handle().clone();
             let app = app_for_setup.clone();
+            if let Some(win) = tauri_app.get_webview_window("main") {
+                if let Some(sess) = persist::load(app.store.data_dir()) {
+                    if let Some(g) = sess.window.as_ref() {
+                        persist::apply_window(&win, g);
+                    }
+                    {
+                        let mut ui = app.ui.lock();
+                        *ui = persist::UiMem {
+                            view: sess.view,
+                            search_q: sess.search_q,
+                            scroll: sess.scroll,
+                        };
+                    }
+                }
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
             let app_restore = app.clone();
             tauri::async_runtime::spawn(async move {
                 restore_session(&app_restore).await;
+                restore_playback(&app_restore).await;
             });
             tauri::async_runtime::spawn(async {
                 crate::ytdlp::maybe_update().await;
@@ -883,7 +1023,27 @@ pub fn run() {
             extract_cookie_names,
             prefetch,
             cache_stats,
+            remember_ui,
+            saved_session,
+            save_session_now,
         ])
-        .run(tauri::generate_context!())
-        .expect("tarn failed to start");
+        .build(tauri::generate_context!())
+        .expect("tarn failed to start")
+        .run(|handle, event| {
+            use tauri::{RunEvent, WindowEvent};
+            match event {
+                RunEvent::WindowEvent { label, event, .. } if label == "main" => {
+                    if matches!(
+                        event,
+                        WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+                    ) {
+                        persist::save(handle);
+                    }
+                }
+                RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+                    persist::save(handle);
+                }
+                _ => {}
+            }
+        });
 }

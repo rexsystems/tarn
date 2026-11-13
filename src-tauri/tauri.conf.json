@@ -22,7 +22,7 @@
         "label": "main",
         "decorations": false,
         "shadow": true,
-        "visible": true
+        "visible": false
       }
     ],
     "security": {

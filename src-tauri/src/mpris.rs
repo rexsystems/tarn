@@ -11,24 +11,6 @@ use tauri::AppHandle;
 use crate::models::Track;
 use crate::player::NextChoice;
 
-pub struct MediaHook {
-    last_id: std::sync::Mutex<Option<String>>,
-    notify: bool,
-}
-
-impl MediaHook {
-    pub fn new() -> Self {
-        Self {
-            last_id: std::sync::Mutex::new(None),
-            notify: true,
-        }
-    }
-
-    pub fn set_notify(&self, on: bool) {
-        let _ = on;
-    }
-}
-
 /// Native window handle required by Windows SMTC. Ignored on other OS.
 /// Native HWND stored as usize so it can cross threads. Ignored off Windows.
 pub type WindowHandle = Option<usize>;
@@ -172,7 +154,6 @@ fn run_souvlaki(app: Arc<crate::App>, hwnd: WindowHandle) -> Result<(), String> 
     let mut last_id: Option<String> = None;
     let mut last_playing: Option<bool> = None;
     let mut last_pos_bucket: u64 = u64::MAX;
-    let mut cover_url: Option<String> = None;
 
     loop {
         while let Ok(ev) = rx.try_recv() {
@@ -202,12 +183,9 @@ fn run_souvlaki(app: Arc<crate::App>, hwnd: WindowHandle) -> Result<(), String> 
                         None
                     },
                     cover_url: t.cover.as_deref(),
-                    ..Default::default()
                 });
                 if id != last_id {
                     maybe_notify(&app, t);
-                    cover_url = t.cover.clone();
-                    let _ = cover_url;
                 }
             }
             let progress = Some(souvlaki::MediaPosition(Duration::from_secs_f64(

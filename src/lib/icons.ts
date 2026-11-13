@@ -35,6 +35,7 @@ export { Notification01Icon } from '@hugeicons/core-free-icons';
 export { Globe02Icon } from '@hugeicons/core-free-icons';
 export { LanguageCircleIcon } from '@hugeicons/core-free-icons';
 export { Tick02Icon } from '@hugeicons/core-free-icons';
+export { ArrowLeft01Icon } from '@hugeicons/core-free-icons';
 export { ArrowRight01Icon } from '@hugeicons/core-free-icons';
 export { Login03Icon } from '@hugeicons/core-free-icons';
 export { PlayCircleIcon } from '@hugeicons/core-free-icons';

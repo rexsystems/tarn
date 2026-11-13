@@ -231,6 +231,8 @@ pub struct Settings {
     pub quality: String,
     pub language: String,
     pub region: String,
+    /// Desktop track-change notifications. Off by default.
+    #[serde(default)]
     pub notifications: bool,
     pub autoplay: bool,
     /// Disk cache cap for prefetched audio, in mebibytes. 0 disables it.
@@ -250,7 +252,7 @@ impl Default for Settings {
             quality: "high".into(),
             language: "en".into(),
             region: "US".into(),
-            notifications: true,
+            notifications: false,
             autoplay: true,
             cache_max_mb: default_cache_mb(),
             crossfade: true,

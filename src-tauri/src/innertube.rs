@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if, clippy::redundant_closure)]
 //! Raw InnerTube helpers: public browse (Home, Explore), likes, lyrics, mutations.
 //! Cookie values are never logged.
 

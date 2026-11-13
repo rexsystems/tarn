@@ -238,3 +238,21 @@ export interface CtxTarget {
   artistId?: string;
   playlistId?: string;
 }
+
+export interface UiSession {
+  view: View | null;
+  search_q: string | null;
+  scroll: number | null;
+}
+
+export interface SavedSession {
+  queue: Track[];
+  index: number;
+  position: number;
+  volume: number;
+  shuffle: boolean;
+  repeat: string;
+  view: View | null;
+  search_q: string | null;
+  scroll: number | null;
+}

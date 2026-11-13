@@ -2,6 +2,8 @@
   import type { Shelf, ShelfItem, Track } from '../types';
   import { itemToTrack } from '../cover';
   import Cover from './Cover.svelte';
+  import Hi from './Hi.svelte';
+  import { PlayIcon } from '../icons';
 
   let {
     shelf,
@@ -68,7 +70,12 @@
           onclick={() => click(item, i)}
           oncontextmenu={(e) => onContext(e, item)}
         >
-          <Cover src={item.cover} size={48} alt="" />
+          <span class="cov qp-cov">
+            <Cover src={item.cover} size={48} alt="" />
+            {#if item.kind === 'track' || item.kind === 'video'}
+              <span class="play-ov"><Hi icon={PlayIcon} size={18} /></span>
+            {/if}
+          </span>
           <div class="tx">
             <div class="title">{item.title}</div>
             <div class="sub">{item.subtitle || item.artists.join(', ')}</div>
@@ -91,6 +98,9 @@
               round={item.kind === 'artist' && shelf.kind !== 'albums' && !shelf.title.toLowerCase().includes('album')}
               alt=""
             />
+            {#if item.kind === 'track' || item.kind === 'video'}
+              <span class="play-ov"><Hi icon={PlayIcon} size={36} /></span>
+            {/if}
           </div>
           <div class="c-a">
             <div class="title">{item.title}</div>

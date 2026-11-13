@@ -20,6 +20,11 @@
   import Dropdown from './lib/components/Dropdown.svelte';
   import Toggle from './lib/components/Toggle.svelte';
   import Skeleton from './lib/components/Skeleton.svelte';
+  import SearchBar from './lib/components/SearchBar.svelte';
+  import Toast from './lib/components/Toast.svelte';
+  import { fail, authPrompt } from './lib/toast';
+  import { friendlyError, isAuthError } from './lib/errors';
+  import { localLikes, isLocalLiked, setLocalLiked, localRecents, recordRecent } from './lib/local';
   import {
     Home01Icon, Search01Icon, Compass01Icon, LibraryIcon, Settings02Icon,
     PlayIcon, PauseIcon, PreviousIcon, NextIcon, ShuffleIcon, RepeatIcon, RepeatOne01Icon,
@@ -33,8 +38,6 @@
   let home = $state<Home | null>(null);
   let explore = $state<Explore | null>(null);
   let searchQ = $state('');
-  let searchFocus = $state(false);
-  let suggestions = $state<string[]>([]);
   let results = $state<SearchResults | null>(null);
   let searchTab = $state<'top' | 'songs' | 'videos' | 'albums' | 'artists' | 'playlists' | 'community'>('top');
   let artist = $state<ArtistPage | null>(null);
@@ -45,15 +48,22 @@
   let library = $state<Library | null>(null);
   let history = $state<Track[] | null>(null);
   let auth = $state<AuthStatus>({ signed_in: false, mock: false, account: null, store: null });
-  let settings = $state<SettingsT>({ quality: 'high', language: 'en', region: 'US', notifications: true, autoplay: true, cache_max_mb: 1024, crossfade: true, crossfade_seconds: 4, album_continuity: true });
+  let settings = $state<SettingsT>({ quality: 'high', language: 'en', region: 'US', notifications: false, autoplay: true, cache_max_mb: 1024, crossfade: true, crossfade_seconds: 4, album_continuity: true });
   let player = $state<PlayerState>({
     track: null, playing: false, loading: false, position: 0, duration: 0,
     volume: 0.85, queue: [], index: 0, error: null, accent: null,
     shuffle: false, repeat: 'off', liked: false, disliked: false, autoplay: true,
   });
   let loading = $state(false);
-  let err = $state<string | null>(null);
+  let libLoading = $state(false);
   let chip = $state<string | null>(null);
+  let mainEl: HTMLElement | undefined = $state();
+  let likes = $state<Track[]>(localLikes());
+  let recents = $state<Track[]>(localRecents());
+  type HistEntry = { view: View; scroll: number; searchQ: string; results: SearchResults | null; searchTab: typeof searchTab };
+  let backStack = $state<HistEntry[]>([]);
+  let fwdStack = $state<HistEntry[]>([]);
+  let navLock = false;
   let panel = $state<null | 'queue' | 'lyrics' | 'related'>(null);
   let expanded = $state(false);
   let scrub = $state<number | null>(null);
@@ -94,25 +104,54 @@
     const unsubs: Array<() => void> = [];
     (async () => {
       home = readHomeCache();
+      likes = localLikes();
+      recents = localRecents();
       try {
         player = await api.state();
         auth = await api.auth();
         settings = await api.settings();
       } catch {}
-      await loadHome();
-      if (auth.signed_in) {
-        api.library().then((l) => (library = l)).catch(() => {});
+      if (!auth.signed_in && player.track && isLocalLiked(player.track.id)) {
+        player.liked = true;
       }
+      try {
+        const sess = await api.savedSession();
+        if (sess?.search_q) searchQ = sess.search_q;
+        if (sess?.view && sess.view.id) {
+          await go(sess.view, { replace: true, scroll: sess.scroll ?? 0 });
+          if (sess.view.id === 'search' && sess.search_q) {
+            await runSearch(sess.search_q, { replace: true });
+          }
+        }
+      } catch {}
+      if (view.id === 'home') await loadHome();
+      if (auth.signed_in) loadLibrary();
     })();
     listen<PlayerState>('player', (e) => {
-      player = e.payload;
+      const next = e.payload;
+      if (!auth.signed_in && next.track && isLocalLiked(next.track.id)) {
+        next.liked = true;
+        next.disliked = false;
+      }
+      if (next.error) {
+        if (isAuthError(next.error)) {
+          next.error = null;
+          authPrompt('expired');
+        } else {
+          next.error = friendlyError(next.error, "Can't play this track");
+        }
+      }
+      player = next;
     }).then((u) => unsubs.push(u));
     listen('auth', () => {
       api.auth().then((a) => {
         auth = a;
         if (a.signed_in) {
-          api.library().then((l) => (library = l)).catch(() => {});
+          loadLibrary();
           loadHome();
+          for (const t of localLikes()) {
+            api.like(t.id, 'like').catch(() => {});
+          }
         }
       });
     }).then((u) => unsubs.push(u));
@@ -127,6 +166,12 @@
         return;
       }
       if (typing) return;
+      if ((e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) || e.key === 'BrowserBack' || e.key === 'BrowserForward') {
+        e.preventDefault();
+        if (e.key === 'ArrowLeft' || e.key === 'BrowserBack') goBack();
+        else goFwd();
+        return;
+      }
       if (e.key === ' ' || e.code === 'MediaPlayPause') {
         e.preventDefault();
         api.toggle();
@@ -149,15 +194,66 @@
       }
     };
     window.addEventListener('keydown', keys);
+
+    const mouseNav = (e: MouseEvent) => {
+      if (e.button === 3 || e.button === 4) {
+        e.preventDefault();
+        if (e.type !== 'mousedown') {
+          if (e.button === 3) goBack();
+          else goFwd();
+        }
+      }
+    };
+    window.addEventListener('mousedown', mouseNav, true);
+    window.addEventListener('mouseup', mouseNav, true);
+    window.addEventListener('auxclick', mouseNav, true);
+
+    const tick = setInterval(() => rememberUi(), 3000);
+    const onHide = () => {
+      rememberUi();
+      api.saveSessionNow().catch(() => {});
+    };
+    window.addEventListener('pagehide', onHide);
+    window.addEventListener('beforeunload', onHide);
+
+    unsubs.push(() => {
+      window.removeEventListener('mousedown', mouseNav, true);
+      window.removeEventListener('mouseup', mouseNav, true);
+      window.removeEventListener('auxclick', mouseNav, true);
+      window.removeEventListener('pagehide', onHide);
+      window.removeEventListener('beforeunload', onHide);
+      clearInterval(tick);
+    });
+
     return () => {
       unsubs.forEach((u) => u());
       window.removeEventListener('keydown', keys);
     };
   });
 
-  function go(v: View) {
-    view = v;
-    err = null;
+  function viewKey(v: View, q = searchQ): string {
+    return JSON.stringify(v) + (v.id === 'search' ? `::${q}` : '');
+  }
+
+  function snapshot(): HistEntry {
+    return {
+      view,
+      scroll: mainEl?.scrollTop ?? 0,
+      searchQ,
+      results,
+      searchTab,
+    };
+  }
+
+  function rememberUi() {
+    api.rememberUi({
+      view,
+      search_q: searchQ || null,
+      scroll: mainEl?.scrollTop ?? 0,
+    }).catch(() => {});
+  }
+
+  function fillView(v: View) {
     ctx = null;
     if (v.id === 'home' && !home) loadHome();
     if (v.id === 'explore' && !explore) loadExplore();
@@ -172,6 +268,60 @@
     if (v.id === 'search') queueMicrotask(() => document.getElementById('q')?.focus());
   }
 
+  function applyEntry(e: HistEntry) {
+    navLock = true;
+    view = e.view;
+    searchQ = e.searchQ;
+    results = e.results;
+    searchTab = e.searchTab;
+    fillView(e.view);
+    const top = e.scroll;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (mainEl) mainEl.scrollTop = top;
+        navLock = false;
+      });
+    });
+    rememberUi();
+  }
+
+  function go(v: View, opts?: { replace?: boolean; scroll?: number }) {
+    if (!opts?.replace && !navLock && viewKey(v) !== viewKey(view)) {
+      backStack = [...backStack, snapshot()];
+      fwdStack = [];
+    }
+    view = v;
+    ctx = null;
+    fillView(v);
+    const top = opts?.scroll ?? 0;
+    requestAnimationFrame(() => {
+      if (mainEl) mainEl.scrollTop = top;
+    });
+    rememberUi();
+  }
+
+  function goBack() {
+    const prev = backStack[backStack.length - 1];
+    if (!prev) return;
+    backStack = backStack.slice(0, -1);
+    fwdStack = [...fwdStack, snapshot()];
+    applyEntry(prev);
+  }
+
+  function goFwd() {
+    const next = fwdStack[fwdStack.length - 1];
+    if (!next) return;
+    fwdStack = fwdStack.slice(0, -1);
+    backStack = [...backStack, snapshot()];
+    applyEntry(next);
+  }
+
+  function needAccount(reason: 'like' | 'dislike' | 'save' | 'playlist' | 'subscribe' | 'expired' | 'continue'): boolean {
+    if (auth.signed_in) return false;
+    authPrompt(reason);
+    return true;
+  }
+
   async function loadHome(params?: string | null) {
     const quiet = !params && !!home;
     if (!quiet) loading = true;
@@ -180,78 +330,94 @@
       home = h;
       if (!params) writeHomeCache(h);
     } catch (e) {
-      if (!home) err = String(e);
+      if (!home) fail(e, "Couldn't load Home");
     } finally {
       loading = false;
     }
   }
   async function loadExplore() {
     loading = true;
-    try { explore = await api.explore(); } catch (e) { err = String(e); } finally { loading = false; }
+    try { explore = await api.explore(); } catch (e) { fail(e, "Couldn't load Explore"); } finally { loading = false; }
   }
   async function loadArtist(id: string) {
     loading = true; artist = null;
-    try { artist = await api.artist(id); } catch (e) { err = String(e); } finally { loading = false; }
+    try { artist = await api.artist(id); } catch (e) { fail(e, "Couldn't load this artist"); } finally { loading = false; }
   }
   async function loadAlbum(id: string) {
     loading = true; collection = null;
-    try { collection = await api.album(id); } catch (e) { err = String(e); } finally { loading = false; }
+    try { collection = await api.album(id); } catch (e) { fail(e, "Couldn't load this album"); } finally { loading = false; }
   }
   async function loadPlaylist(id: string) {
     loading = true; collection = null;
-    try { collection = await api.playlist(id); } catch (e) { err = String(e); } finally { loading = false; }
+    try { collection = await api.playlist(id); } catch (e) { fail(e, "Couldn't load this playlist"); } finally { loading = false; }
   }
   async function loadGenre(id: string) {
     loading = true; genre = null;
-    try { genre = await api.genre(id); } catch (e) { err = String(e); } finally { loading = false; }
+    try { genre = await api.genre(id); } catch (e) { fail(e, "Couldn't load this page"); } finally { loading = false; }
   }
   async function loadCharts() {
     loading = true;
-    try { charts = await api.charts(); } catch (e) { err = String(e); } finally { loading = false; }
+    try { charts = await api.charts(); } catch (e) { fail(e, "Couldn't load charts"); } finally { loading = false; }
   }
   async function loadReleases() {
     loading = true;
-    try { releases = await api.newReleases(); } catch (e) { err = String(e); } finally { loading = false; }
+    try { releases = await api.newReleases(); } catch (e) { fail(e, "Couldn't load new releases"); } finally { loading = false; }
   }
   async function loadLibrary() {
-    try { library = await api.library(); } catch { library = { signed_in: auth.signed_in, mock: auth.mock, account: auth.account, playlists: [], liked: [], albums: [], artists: [], recents: [] }; }
+    if (!auth.signed_in) {
+      libLoading = false;
+      return;
+    }
+    if (!library) libLoading = true;
+    try {
+      library = await api.library();
+    } catch (e) {
+      fail(e, "Couldn't load your library");
+      if (!library) {
+        library = { signed_in: auth.signed_in, mock: auth.mock, account: auth.account, playlists: [], liked: [], albums: [], artists: [], recents: [] };
+      }
+    } finally {
+      libLoading = false;
+    }
   }
   async function loadHistory() {
     loading = true;
-    try { history = await api.history(); } catch (e) { err = String(e); history = []; } finally { loading = false; }
+    try { history = await api.history(); } catch (e) { fail(e, "Couldn't load history"); history = []; } finally { loading = false; }
   }
 
-  let sugTimer: ReturnType<typeof setTimeout> | undefined;
-  function onQuery(q: string) {
-    searchQ = q;
-    clearTimeout(sugTimer);
-    if (!q.trim()) { suggestions = []; return; }
-    sugTimer = setTimeout(() => {
-      api.suggestions(q).then((s) => (suggestions = s)).catch(() => {});
-    }, 160);
-  }
-  async function runSearch(q?: string) {
+  async function runSearch(q?: string, opts?: { replace?: boolean }) {
     const qq = (q ?? searchQ).trim();
     if (!qq) return;
     searchQ = qq;
-    suggestions = [];
-    searchFocus = false;
     loading = true;
-    view = { id: 'search' };
-    try { results = await api.searchAll(qq); searchTab = 'top'; } catch (e) { err = String(e); } finally { loading = false; }
+    if (view.id !== 'search') go({ id: 'search' }, { replace: opts?.replace });
+    else rememberUi();
+    try {
+      results = await api.searchAll(qq);
+      searchTab = 'top';
+    } catch (e) {
+      fail(e, "Couldn't search");
+    } finally {
+      loading = false;
+    }
   }
 
   async function playTracks(tracks: Track[], index: number) {
     if (!tracks.length) return;
     const t = tracks[index] ?? tracks[0];
-    try { await api.play(t, tracks, index); } catch (e) { err = String(e); }
+    recents = recordRecent(t);
+    try {
+      await api.play(t, tracks, index);
+    } catch (e) {
+      fail(e, "Can't play this track");
+    }
   }
   function playOne(t: Track) { playTracks([t, ...player.queue.filter((x) => x.id !== t.id)], 0); }
 
   async function startRadio(id?: string) {
     const vid = id || player.track?.id;
     if (!vid) return;
-    try { await api.radio(vid); } catch (e) { err = String(e); }
+    try { await api.radio(vid); } catch (e) { fail(e, "Couldn't start radio"); }
   }
 
   function shuffled<T>(xs: T[]): T[] {
@@ -287,7 +453,7 @@
       if (!tracks.length) { openItem(item); return; }
       if (shuffle) api.setShuffle(true);
       playTracks(shuffle ? shuffled(tracks) : tracks, 0);
-    } catch (e) { err = String(e); }
+    } catch (e) { fail(e, "Can't play this"); }
   }
 
   function openItem(item: ShelfItem) {
@@ -336,17 +502,44 @@
     ctx = { x: e.clientX, y: e.clientY, track: t, albumId: t.album_id || undefined, artistId: t.artist_ids?.[0] };
   }
 
-  async function like(action: string) {
-    const id = player.track?.id;
-    if (!id) return;
+  function applyLocalLike(track: Track, liked: boolean) {
+    likes = setLocalLiked(track, liked);
+    if (player.track?.id === track.id) {
+      player.liked = liked;
+      if (liked) player.disliked = false;
+    }
+  }
+
+  async function likeTrack(track: Track | undefined, action: string) {
+    if (!track?.id) return;
+    if (!auth.signed_in) {
+      if (action === 'like') applyLocalLike(track, true);
+      else if (action === 'removelike') applyLocalLike(track, false);
+      else if (action === 'dislike') applyLocalLike(track, false);
+      authPrompt(action === 'dislike' ? 'dislike' : 'like');
+      return;
+    }
     try {
-      const st = await api.like(id, action);
+      const st = await api.like(track.id, action);
       player.liked = st.liked;
       player.disliked = st.disliked;
-    } catch (e) { err = String(e); }
+      if (player.track?.id === track.id) {
+        /* already applied */
+      }
+      if (st.liked) likes = setLocalLiked(track, true);
+      else if (action !== 'dislike') likes = setLocalLiked(track, false);
+    } catch (e) {
+      fail(e, "Couldn't update this", action === 'dislike' ? 'dislike' : 'like');
+    }
+  }
+  async function like(action: string) {
+    const t = player.track;
+    if (t) await likeTrack(t, action);
   }
   async function toggleLike() {
-    await like(player.liked ? 'removelike' : 'like');
+    const t = player.track;
+    if (!t) return;
+    await likeTrack(t, (player.liked || isLocalLiked(t.id)) ? 'removelike' : 'like');
   }
   async function toggleDislike() {
     await like(player.disliked ? 'removelike' : 'dislike');
@@ -405,6 +598,7 @@
   async function addToPlaylist(pid: string, videoId?: string) {
     const vid = videoId || ctx?.track?.id;
     if (!vid) return;
+    if (needAccount('playlist')) return;
     if (!pid) {
       const title = prompt('Playlist name');
       if (!title) return;
@@ -412,10 +606,10 @@
         const id = await api.playlistCreate(title);
         await api.playlistAdd(id, vid);
         loadLibrary();
-      } catch (e) { err = String(e); }
+      } catch (e) { fail(e, "Couldn't create this playlist", 'playlist'); }
       return;
     }
-    try { await api.playlistAdd(pid, vid); } catch (e) { err = String(e); }
+    try { await api.playlistAdd(pid, vid); } catch (e) { fail(e, "Couldn't add to this playlist", 'playlist'); }
   }
 
   function goArtist(id: string, name?: string) {
@@ -462,7 +656,7 @@
 </script>
 
 <div class="app" style="--player: 112px; --side: 248px; --titlebar: 36px;">
-  <TitleBar />
+  <TitleBar canBack={backStack.length > 0} canFwd={fwdStack.length > 0} onBack={goBack} onFwd={goFwd} />
   <aside class="sidebar" class:is-hidden={expanded}>
     <div class="brand">
       <img src="/logo.png" width="44" height="44" alt="" />
@@ -521,9 +715,8 @@
     </div>
   </aside>
 
-  <main class="main {panel ? 'with-panel' : ''}" class:is-hidden={expanded}>
+  <main class="main {panel ? 'with-panel' : ''}" class:is-hidden={expanded} bind:this={mainEl}>
     <div class="page">
-      {#if err}<div class="err">{err}</div>{/if}
 
       {#if view.id === 'home'}
         {#if home?.chips?.length}
@@ -539,6 +732,12 @@
         {/each}
 
       {:else if view.id === 'explore'}
+        <SearchBar
+          bind:value={searchQ}
+          onSubmit={(q) => runSearch(q)}
+          onPlay={(t, queue) => playTracks(queue, Math.max(0, queue.findIndex((x) => x.id === t.id)))}
+          onOpen={openItem}
+        />
         <h1 class="page-title">Explore</h1>
         <div class="explore-links">
           <button type="button" onclick={() => go({ id: 'new-releases' })}><Hi icon={Album02Icon} size={24} /> New releases</button>
@@ -568,27 +767,13 @@
         {/each}
 
       {:else if view.id === 'search'}
-        <div class="search-bar">
-          <div class="search-wrap">
-            <span class="sic"><Hi icon={Search01Icon} size={20} /></span>
-            <input
-              id="q"
-              placeholder="Search"
-              bind:value={searchQ}
-              oninput={(e) => onQuery(e.currentTarget.value)}
-              onfocus={() => (searchFocus = true)}
-              onblur={() => setTimeout(() => (searchFocus = false), 180)}
-              onkeydown={(e) => e.key === 'Enter' && runSearch()}
-            />
-            {#if searchFocus && suggestions.length}
-              <div class="sug">
-                {#each suggestions as s}
-                  <button type="button" onclick={() => runSearch(s)}>{s}</button>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        </div>
+        <SearchBar
+          bind:value={searchQ}
+          autofocus
+          onSubmit={(q) => runSearch(q)}
+          onPlay={(t, queue) => playTracks(queue, Math.max(0, queue.findIndex((x) => x.id === t.id)))}
+          onOpen={openItem}
+        />
         {#if loading && !results}<Skeleton kind="search" />{/if}
         {#if results}
           <div class="tabs">
@@ -615,7 +800,12 @@
               onkeydown={(e) => e.key === 'Enter' && openItem(top)}
               oncontextmenu={(e) => contextItem(e, top)}
             >
-              <Cover src={top.cover} size={160} round={top.kind === 'artist'} alt="" />
+              <div class="top-art">
+                <Cover src={top.cover} size={160} round={top.kind === 'artist'} alt="" />
+                {#if top.kind === 'track' || top.kind === 'video'}
+                  <span class="play-ov"><Hi icon={PlayIcon} size={40} /></span>
+                {/if}
+              </div>
               <div>
                 <div class="k">{top.kind}</div>
                 <div class="ttl">{top.title}</div>
@@ -707,8 +897,39 @@
       {:else if view.id === 'library'}
         <h1 class="page-title">Library {#if auth.mock}<span class="badge">Preview</span>{/if}</h1>
         {#if !auth.signed_in}
-          <div class="empty"></div>
+          <div class="lib-guest">
+            <img src="/logo.png" width="80" height="80" alt="" />
+            <p>Sign in to see your playlists, likes and albums</p>
+            <button class="btn" type="button" onclick={() => api.openLogin()}>Sign in</button>
+          </div>
+          {#if recents.length}
+            <h2 class="shelf-title" style="margin:12px 0 12px">Recently played</h2>
+            <TrackTable
+              tracks={recents}
+              currentId={player.track?.id}
+              playing={player.playing}
+              onPlay={(t, i) => playTracks(recents, i)}
+              onArtist={(id, n) => goArtist(id, n)}
+              onAlbum={(id) => go({ id: 'album', albumId: id })}
+              onContext={(e, t) => contextTrack(e, t)}
+            />
+          {/if}
+          {#if likes.length}
+            <h2 class="shelf-title" style="margin:28px 0 12px">Liked songs</h2>
+            <TrackTable
+              tracks={likes}
+              currentId={player.track?.id}
+              playing={player.playing}
+              onPlay={(t, i) => playTracks(likes, i)}
+              onArtist={(id, n) => goArtist(id, n)}
+              onAlbum={(id) => go({ id: 'album', albumId: id })}
+              onContext={(e, t) => contextTrack(e, t)}
+            />
+          {/if}
         {:else}
+          {#if libLoading && !library}
+            <Skeleton kind="page" />
+          {/if}
           <div class="tabs" style="padding-top:0">
             <button class="tab on" type="button" onclick={() => go({ id: 'history' })}><Hi icon={HistoryIcon} size={18} /> History</button>
           </div>
@@ -790,7 +1011,7 @@
                   <button class="btn ghost" type="button" onclick={() => api.artistRadio(artist!.radio_id!)}><Hi icon={Radio02Icon} size={18} /> Radio</button>
                 {/if}
                 {#if auth.signed_in}
-                  <button class="btn ghost {artist.subscribed ? 'on' : ''}" type="button" onclick={async () => { const on = !artist!.subscribed; try { await api.subscribe(artist!.id, on); artist = { ...artist!, subscribed: on }; } catch (e) { err = String(e); } }}>
+                  <button class="btn ghost {artist.subscribed ? 'on' : ''}" type="button" onclick={async () => { if (needAccount('subscribe')) return; const on = !artist!.subscribed; try { await api.subscribe(artist!.id, on); artist = { ...artist!, subscribed: on }; } catch (e) { fail(e, "Couldn't subscribe", 'subscribe'); } }}>
                     {artist.subscribed ? 'Subscribed' : 'Subscribe'}
                   </button>
                 {/if}
@@ -880,7 +1101,7 @@
                 <button class="btn ghost" type="button" onclick={() => { api.setShuffle(true); playTracks([...collection!.tracks].sort(() => Math.random() - 0.5), 0); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
                 <button class="btn ghost" type="button" onclick={() => collection!.tracks[0] && startRadio(collection!.tracks[0].id)}><Hi icon={Radio02Icon} size={18} /> Radio</button>
                 {#if auth.signed_in}
-                  <button class="btn ghost {collection.saved ? 'on' : ''}" type="button" onclick={async () => { const s = !collection!.saved; try { await api.librarySave(collection!.playlist_id || collection!.id, s); collection = { ...collection!, saved: s }; } catch (e) { err = String(e); } }}>
+                  <button class="btn ghost {collection.saved ? 'on' : ''}" type="button" onclick={async () => { if (needAccount('save')) return; const s = !collection!.saved; try { await api.librarySave(collection!.playlist_id || collection!.id, s); collection = { ...collection!, saved: s }; } catch (e) { fail(e, "Couldn't save this", 'save'); } }}>
                     <Hi icon={Bookmark02Icon} size={18} /> {collection.saved ? 'Saved' : 'Save'}
                   </button>
                 {/if}
@@ -1153,7 +1374,7 @@
         </div>
       </div>
       <div class="right-c">
-        {#if player.error}<span class="err">{player.error}</span>{/if}
+        {#if player.error}<span class="err">{friendlyError(player.error, "Can't play this track")}</span>{/if}
         {#if player.loading}<div class="spin"></div>{/if}
         <IconBtn icon={MicVocalIcon} size={22} on={panel === 'lyrics'} onclick={() => openPanel('lyrics')} title="Lyrics" btnSize="lg" />
         <IconBtn icon={Queue02Icon} size={22} on={panel === 'queue'} onclick={() => openPanel('queue')} title="Queue" btnSize="lg" />
@@ -1173,6 +1394,8 @@
   </footer>
 </div>
 
+<Toast />
+
 {#if ctx}
   <ContextMenu
     x={ctx.x}
@@ -1184,13 +1407,17 @@
     onPlayNext={() => ctx?.track && api.queueAdd([ctx.track], true)}
     onQueue={() => ctx?.track && api.queueAdd([ctx.track], false)}
     onRadio={() => ctx?.track && startRadio(ctx.track.id)}
-    onLike={() => ctx?.track && api.like(ctx.track.id, 'like')}
-    onDislike={() => ctx?.track && api.like(ctx.track.id, 'dislike')}
+    onLike={() => ctx?.track && likeTrack(ctx.track, 'like')}
+    onDislike={() => ctx?.track && likeTrack(ctx.track, 'dislike')}
     onArtist={() => goArtist(ctx?.artistId || ctx?.track?.artist_ids?.[0] || '', ctx?.track?.artists?.[0])}
     onAlbum={() => (ctx?.albumId || ctx?.track?.album_id) && go({ id: 'album', albumId: ctx!.albumId || ctx!.track!.album_id! })}
     onShare={() => share(ctx?.track)}
     onAddTo={(id) => addToPlaylist(id)}
-    onSave={() => (ctx?.playlistId || ctx?.albumId) && api.librarySave(ctx!.playlistId || ctx!.albumId!, true)}
+    onSave={() => {
+      if (needAccount('save')) return;
+      const id = ctx?.playlistId || ctx?.albumId;
+      if (id) api.librarySave(id, true).catch((e) => fail(e, "Couldn't save this", 'save'));
+    }}
     onClose={() => (ctx = null)}
   />
 {/if}

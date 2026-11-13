@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   ArtistPage, AuthStatus, Collection, Explore, GenrePage, Home, Library,
-  LikeState, Lyrics, PlayerState, Related, SearchResults, Settings, Track,
+  LikeState, Lyrics, PlayerState, Related, SearchResults, Settings, Track, SavedSession, UiSession,
 } from './types';
 
 export const api = {
@@ -55,4 +55,8 @@ export const api = {
   setSettings: (settings: Settings) => invoke<void>('set_settings', { settings }),
   prefetch: (id: string) => { void invoke<void>('prefetch', { id }); },
   cacheStats: () => invoke<[number, number]>('cache_stats'),
+  savedSession: () => invoke<SavedSession | null>('saved_session'),
+  rememberUi: (ui: UiSession) => invoke<void>('remember_ui', { ui }),
+  saveSessionNow: () => invoke<void>('save_session_now'),
 };
+
