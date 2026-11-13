@@ -369,8 +369,13 @@ fn start_smtc_ui(
 
     // Leak a RefCell so we can touch the object only on this thread.
     // `MediaControls` may not be Send; `run_on_main_thread` keeps access here.
-    let slot: &'static RefCell<Option<MediaControls>> =
-        Box::leak(Box::new(RefCell::new(Some(controls))));
+    struct MainThreadSlot(RefCell<Option<MediaControls>>);
+    // SAFETY: the slot is only ever borrowed inside `run_on_main_thread`
+    // closures, so every access happens on the UI thread that created it.
+    unsafe impl Sync for MainThreadSlot {}
+    unsafe impl Send for MainThreadSlot {}
+    let slot: &'static MainThreadSlot =
+        Box::leak(Box::new(MainThreadSlot(RefCell::new(Some(controls)))));
 
     std::thread::Builder::new()
         .name("tarn-smtc-loop".into())
@@ -397,7 +402,7 @@ fn start_smtc_ui(
                     }
                     if let Err(e) = handle.run_on_main_thread(move || {
                         use souvlaki::{MediaMetadata, MediaPlayback};
-                        let mut slot = slot.borrow_mut();
+                        let mut slot = slot.0.borrow_mut();
                         let Some(controls) = slot.as_mut() else {
                             return;
                         };

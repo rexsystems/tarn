@@ -297,6 +297,7 @@ pub enum StoreKind {
 }
 
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn restrict_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
     {
