@@ -25,7 +25,10 @@
   let kind = $derived((() => {
     const pid = (id || '').replace(/^VL/, '');
     const n = (name || '').toLowerCase();
-    if (pid === 'LM' || n === 'liked music' || n === 'liked songs') return 'liked' as const;
+    // Home Fresh finds / Listen again use RDAMPLLM, library uses LM.
+    if (pid === 'LM' || pid === 'RDAMPLLM' || n === 'liked music' || n === 'liked songs') {
+      return 'liked' as const;
+    }
     if (pid === 'SE' || n.includes('episodes for later')) return 'episodes' as const;
     return 'normal' as const;
   })());
@@ -60,7 +63,8 @@
     }
     return out;
   })());
-  let mosaic = $derived(kind === 'normal' && tiles.length >= 2);
+  // Full 2×2 only — 2–3 tiles used to leave black placeholder cells on Home.
+  let mosaic = $derived(kind === 'normal' && tiles.length >= 4);
   let iconSize = $derived(Math.max(14, Math.round(size * 0.42)));
 </script>
 
@@ -92,7 +96,7 @@
     role={alt ? 'img' : undefined}
     aria-label={alt || undefined}
   >
-    {#each tiles as src, i (src + i)}
+    {#each tiles.slice(0, 4) as src, i (src + i)}
       <img
         src={sizedCover(src, Math.max(48, Math.round(size)))}
         {alt}
@@ -100,11 +104,6 @@
         draggable="false"
       />
     {/each}
-    {#if tiles.length === 2}
-      <div class="ph"></div><div class="ph"></div>
-    {:else if tiles.length === 3}
-      <div class="ph"></div>
-    {/if}
   </div>
 {:else}
   <Cover src={cover || tiles[0] || null} {size} {alt} class={cls} />

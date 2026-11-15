@@ -2,6 +2,7 @@
   import type { Shelf, ShelfItem, Track } from '../types';
   import { itemToTrack } from '../cover';
   import Cover from './Cover.svelte';
+  import PlaylistCover from './PlaylistCover.svelte';
   import Hi from './Hi.svelte';
   import { PlayIcon } from '../icons';
 
@@ -118,12 +119,23 @@
             title="Play"
             onclick={() => playItem(item, i)}
           >
-            <Cover
-              src={item.cover}
-              size={isArtistCard(item) ? 132 : 152}
-              round={isArtistCard(item)}
-              alt=""
-            />
+            {#if item.kind === 'playlist'}
+              <PlaylistCover
+                id={item.id}
+                name={item.title}
+                cover={item.cover}
+                covers={item.covers}
+                size={152}
+                alt=""
+              />
+            {:else}
+              <Cover
+                src={item.cover}
+                size={isArtistCard(item) ? 132 : 152}
+                round={isArtistCard(item)}
+                alt=""
+              />
+            {/if}
             <span class="play-ov"><Hi icon={PlayIcon} size={isArtistCard(item) ? 28 : 36} /></span>
           </button>
           <button class="c-a" type="button" onclick={() => openOrPlay(item, i)}>

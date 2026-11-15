@@ -596,13 +596,21 @@
 
   async function playTopShuffled(top: ShelfItem) {
     const songs = results?.songs?.length ? results.songs : [itemToTrack(top)];
-    // Backend reshuffles the live queue so Up next matches; keep original order here.
+    await api.cutAudio();
+    await api.armShuffle(true);
     await playTracks(songs, 0);
-    api.setShuffle(true);
   }
 
   async function playCollection(item: ShelfItem, shuffle: boolean) {
     try {
+      // Playlists/mixes: cut old audio in Rust, fetch, start at 0. Don't leave
+      // the previous song playing while RD* mixes take a few seconds to load.
+      if (item.kind === 'playlist') {
+        await api.playPlaylist(item.id, shuffle);
+        return;
+      }
+      await api.cutAudio();
+      await api.armShuffle(shuffle);
       let tracks: Track[] = [];
       let cover: string | null = item.cover ?? null;
       if (item.kind === 'artist') {
@@ -613,17 +621,11 @@
         const c = await api.album(item.id || item.browse_id || '');
         tracks = c.tracks;
         cover = c.cover ?? cover;
-      } else if (item.kind === 'playlist') {
-        const c = await api.playlist(item.id);
-        tracks = c.tracks;
-        cover = c.cover ?? cover;
       } else if (item.kind === 'track' || item.kind === 'video') {
         tracks = [itemToTrack(item)];
       }
       if (!tracks.length) { openItem(item); return; }
       await playTracks(tracks, 0, cover);
-      if (shuffle) api.setShuffle(true);
-      else api.setShuffle(false);
     } catch (e) { fail(e, "Can't play this"); }
   }
 
@@ -1441,8 +1443,8 @@
                 <div class="sub">{fmtCount(artist.subscribers)} subscribers</div>
               {/if}
               <div class="hero-acts">
-                <button class="btn" type="button" onclick={() => playTracks(artist!.tracks, 0)}><Hi icon={PlayIcon} size={18} /> Play</button>
-                <button class="btn ghost" type="button" onclick={async () => { await playTracks(artist!.tracks, 0); api.setShuffle(true); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
+                <button class="btn" type="button" onclick={async () => { await api.cutAudio(); await api.armShuffle(false); await playTracks(artist!.tracks, 0); }}><Hi icon={PlayIcon} size={18} /> Play</button>
+                <button class="btn ghost" type="button" onclick={async () => { await api.cutAudio(); await api.armShuffle(true); await playTracks(artist!.tracks, 0); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
                 {#if artist.radio_id}
                   <button class="btn ghost" type="button" onclick={() => api.artistRadio(artist!.radio_id!)}><Hi icon={Radio02Icon} size={18} /> Radio</button>
                 {/if}
@@ -1545,8 +1547,8 @@
                 {#if collection.track_count} · {collection.track_count}{/if}
               </div>
               <div class="hero-acts">
-                <button class="btn" type="button" onclick={() => playTracks(collection!.tracks, 0, collection!.cover)}><Hi icon={PlayIcon} size={18} /> Play</button>
-                <button class="btn ghost" type="button" onclick={async () => { await playTracks(collection!.tracks, 0, collection!.cover); api.setShuffle(true); }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
+                <button class="btn" type="button" onclick={async () => { if (collection!.kind === 'playlist') { await api.playPlaylist(collection!.playlist_id || collection!.id, false); } else { await api.cutAudio(); await api.armShuffle(false); await playTracks(collection!.tracks, 0, collection!.cover); } }}><Hi icon={PlayIcon} size={18} /> Play</button>
+                <button class="btn ghost" type="button" onclick={async () => { if (collection!.kind === 'playlist') { await api.playPlaylist(collection!.playlist_id || collection!.id, true); } else { await api.cutAudio(); await api.armShuffle(true); await playTracks(collection!.tracks, 0, collection!.cover); } }}><Hi icon={ShuffleIcon} size={18} /> Shuffle</button>
                 <button class="btn ghost" type="button" onclick={() => collection!.tracks[0] && startRadio(collection!.tracks[0].id)}><Hi icon={Radio02Icon} size={18} /> Radio</button>
                 {#if auth.signed_in}
                   <button class="btn ghost {collection.saved ? 'on' : ''}" type="button" onclick={async () => { if (needAccount('save')) return; const s = !collection!.saved; try { await api.librarySave(collection!.playlist_id || collection!.id, s); collection = { ...collection!, saved: s }; } catch (e) { fail(e, "Couldn't save this", 'save'); } }}>

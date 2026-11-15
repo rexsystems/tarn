@@ -20,6 +20,9 @@ export const api = {
   related: (id: string) => invoke<Related>('get_related', { id }),
   play: (track: Track, queue: Track[], index: number) =>
     invoke<void>('play', { track, queue, index }),
+  /** Cut old audio, fetch playlist/mix, start at track 0. */
+  playPlaylist: (id: string, shuffle: boolean) =>
+    invoke<void>('play_playlist', { id, shuffle }),
   radio: (id: string) => invoke<void>('start_radio', { id }),
   artistRadio: (radioId: string) => invoke<void>('start_artist_radio', { radioId }),
   pause: () => invoke<void>('pause'),
@@ -31,6 +34,8 @@ export const api = {
   next: () => invoke<void>('next'),
   prev: () => invoke<void>('prev'),
   setShuffle: (on: boolean) => invoke<void>('set_shuffle', { on }),
+  armShuffle: (on: boolean) => invoke<void>('arm_shuffle', { on }),
+  cutAudio: () => invoke<void>('cut_audio'),
   setRepeat: (mode: string) => invoke<void>('set_repeat', { mode }),
   cycleRepeat: () => invoke<string>('cycle_repeat'),
   queueAdd: (tracks: Track[], next: boolean) => invoke<void>('queue_add', { tracks, next }),

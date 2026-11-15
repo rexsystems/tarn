@@ -329,6 +329,9 @@ impl Ytm {
         let signed = self.cookie_header().is_some();
         home.signed_in = signed;
         self.harvest_cookies();
+        // Mix cards ship mixart URLs that need YTM cookies in the webview -
+        // strip leaves cover=None ("?"). Fill from the first playable tracks.
+        self.enrich_home_playlist_covers(&mut home).await;
         // When signed in, the InnerTube feed IS the product - do not pad
         // it with the logged-out charts/trending filler.
         if signed {
@@ -860,30 +863,52 @@ impl Ytm {
                         return Ok(c);
                     }
                 }
-                // Home/library "… - Radio" cards often keep a short PL id that
-                // has no shelf contents; the playable seed is RDAMPL{playlist}.
-                if bare.starts_with("PL") || bare.starts_with("OL") {
-                    let radio = format!("RDAMPL{bare}");
-                    if let Ok(mut c) = self.mix_collection(&radio).await {
-                        if !c.tracks.is_empty() {
-                            c.id = bare.to_string();
-                            c.playlist_id = Some(bare.to_string());
-                            return Ok(c);
-                        }
-                    }
-                }
                 Err(anyhow!("{e}"))
             }
         }
     }
 
     /// New Release / Archive / Discover mixes and other RD* radios.
+    /// Never call `radio_playlist` on an id that already starts with `RD` —
+    /// rustypipe prepends `RDAMPL` and returns an unrelated automix.
     async fn mix_collection(&self, radio_id: &str) -> Result<Collection> {
-        let tracks = match self.radio_id(radio_id).await {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => self.radio_playlist(radio_id).await?,
+        let from_radio = match self.radio_id(radio_id).await {
+            Ok(t) if !t.is_empty() => Some(dedup_tracks(t)),
+            _ => None,
         };
-        let tracks = dedup_tracks(tracks);
+        // Thin radio pages (sometimes 1 track) — prefer VL browse when richer.
+        let tracks = match from_radio {
+            Some(t) if t.len() >= 5 => t,
+            Some(thin) => match self.playlist_via_innertube(radio_id, None).await {
+                Ok(c) if c.tracks.len() > thin.len() => {
+                    let mut c = c;
+                    c.id = radio_id.into();
+                    c.playlist_id = Some(radio_id.into());
+                    if c.name.is_empty() || c.name.eq_ignore_ascii_case("playlist") {
+                        c.name = "Mix".into();
+                    }
+                    stamp_missing_track_covers(&mut c);
+                    return Ok(c);
+                }
+                _ => thin,
+            },
+            None => match self.playlist_via_innertube(radio_id, None).await {
+                Ok(mut c) if !c.tracks.is_empty() => {
+                    c.id = radio_id.into();
+                    c.playlist_id = Some(radio_id.into());
+                    if c.name.is_empty() || c.name.eq_ignore_ascii_case("playlist") {
+                        c.name = "Mix".into();
+                    }
+                    stamp_missing_track_covers(&mut c);
+                    return Ok(c);
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "mix {radio_id}: radio empty/failed and VL browse had no tracks"
+                    ));
+                }
+            },
+        };
         let n = tracks.len() as u64;
         let mut c = Collection {
             kind: "playlist".into(),
@@ -1095,11 +1120,20 @@ impl Ytm {
         }
     }
 
+    /// Seed radio from a bare playlist id (`PL…` / `OL…`). Do not pass ids that
+    /// already start with `RD` — rustypipe prepends `RDAMPL` and invents a
+    /// different automix (broke Archive/Replay/Discover Home cards).
     pub async fn radio_playlist(&self, playlist_id: &str) -> Result<Vec<Track>> {
+        let bare = playlist_id.trim_start_matches("VL");
+        if bare.starts_with("RD") {
+            return Err(anyhow!(
+                "radio_playlist refuses RD* id {bare} (would become RDAMPL{bare})"
+            ));
+        }
         let r = self
             .rp
             .query()
-            .music_radio_playlist(playlist_id)
+            .music_radio_playlist(bare)
             .await
             .map_err(|e| anyhow!("{e}"))?;
         Ok(r.items.iter().map(track_from).collect())
@@ -1383,6 +1417,125 @@ impl Ytm {
             .await
             .map_err(|e| anyhow!("{e}"))?;
         Ok(h.items.iter().map(|hi| track_from(&hi.item)).collect())
+    }
+
+    /// Home mix cards (New Release / Archive / …) use `/mixart` thumbs that
+    /// the webview cannot load. Replace missing covers with track art.
+    /// Only algorithmic mixes (`RDTMAK…`) — not community `PL…` cards.
+    async fn enrich_home_playlist_covers(&self, home: &mut Home) {
+        let mut jobs: Vec<(usize, usize, String)> = Vec::new();
+        for (si, shelf) in home.shelves.iter().enumerate() {
+            for (ii, item) in shelf.items.iter().enumerate() {
+                if item.kind != "playlist" {
+                    continue;
+                }
+                if item.cover.as_deref().is_some_and(usable_cover) {
+                    continue;
+                }
+                let id = item.id.trim_start_matches("VL").to_string();
+                // Algorithmic YTM mixes only (Fresh finds). Skip Liked / SE /
+                // community PL cards — those either have special art or their
+                // own thumbs; fetching them here caused wrong mosaics.
+                if !id.starts_with("RDTMAK") {
+                    continue;
+                }
+                jobs.push((si, ii, id));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        jobs.truncate(12);
+        let mut cursor = 0;
+        while cursor < jobs.len() {
+            let batch: Vec<(usize, usize, String)> =
+                jobs[cursor..].iter().cloned().take(4).collect();
+            cursor += batch.len();
+            let id0 = batch[0].2.clone();
+            let id1 = batch.get(1).map(|j| j.2.clone());
+            let id2 = batch.get(2).map(|j| j.2.clone());
+            let id3 = batch.get(3).map(|j| j.2.clone());
+            let (r0, r1, r2, r3) = tokio::join!(
+                self.playlist_shelf_covers(&id0),
+                async {
+                    if let Some(id) = id1.as_deref() {
+                        self.playlist_shelf_covers(id).await
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if let Some(id) = id2.as_deref() {
+                        self.playlist_shelf_covers(id).await
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if let Some(id) = id3.as_deref() {
+                        self.playlist_shelf_covers(id).await
+                    } else {
+                        None
+                    }
+                },
+            );
+            for (slot, tiles) in [r0, r1, r2, r3].into_iter().enumerate() {
+                if slot >= batch.len() {
+                    break;
+                }
+                let Some(tiles) = tiles else { continue };
+                if tiles.is_empty() {
+                    continue;
+                }
+                let (si, ii) = (batch[slot].0, batch[slot].1);
+                let item = &mut home.shelves[si].items[ii];
+                if item.cover.as_deref().is_none_or(|u| !usable_cover(u)) {
+                    item.cover = tiles.first().cloned();
+                }
+                // Only attach a mosaic when we have a full 2×2 — fewer tiles
+                // used to leave black placeholder cells on Home.
+                if distinct_cover_count(&tiles) >= 4 {
+                    item.covers = tiles.into_iter().take(4).collect();
+                }
+            }
+        }
+    }
+
+    async fn playlist_shelf_covers(&self, id: &str) -> Option<Vec<String>> {
+        let tracks = if id.starts_with("RD") {
+            match self.radio_id(id).await {
+                Ok(t) if !t.is_empty() => t,
+                // Do NOT radio_playlist(RD*) — that becomes RDAMPL+RD* and
+                // paints the wrong automix on the card.
+                _ => match self.playlist_via_innertube(id, None).await {
+                    Ok(c) if !c.tracks.is_empty() => c.tracks,
+                    _ => return None,
+                },
+            }
+        } else {
+            match self.rp.query().music_playlist(id).await {
+                Ok(p) => p.tracks.items.iter().map(track_from).collect(),
+                Err(_) => return None,
+            }
+        };
+        let mut tiles = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for t in tracks.iter().take(12) {
+            let Some(c) = t.cover.as_ref().filter(|u| usable_cover(u)) else {
+                continue;
+            };
+            if seen.insert(thumb_dedupe_key(c)) {
+                tiles.push(c.clone());
+                if tiles.len() == 4 {
+                    break;
+                }
+            }
+        }
+        if tiles.is_empty() {
+            None
+        } else {
+            Some(tiles)
+        }
     }
 
     /// Fill missing / mixart playlist covers from the first tracks (2×2 mosaic).

@@ -1256,8 +1256,9 @@ html { color-scheme: dark; }
 
 /* ---------- now playing expanded ---------- */
 .np {
-  /* Full app plane under chrome. Spanning only the middle row left
-     black titlebar/player gutters when chrome faded to opacity 0. */
+  /* Full app plane while chrome is hidden. When the player is visible,
+     the active Now Playing view stops above it so lyric lines never
+     disappear behind the playback controls. */
   grid-column: 1 / -1;
   grid-row: 1 / -1;
   position: relative;
@@ -1266,6 +1267,9 @@ html { color-scheme: dark; }
   background: var(--bg);
   min-width: 0;
   min-height: 0;
+}
+.app.np-open:not(.np-idle) .np {
+  grid-row: 1 / 3;
 }
 .np-stage {
   position: absolute;

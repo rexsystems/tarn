@@ -48,6 +48,8 @@ export interface ShelfItem {
   title: string;
   subtitle: string | null;
   cover: string | null;
+  /** Up to 4 track covers for mix mosaics when header art is unusable. */
+  covers?: string[];
   artists: string[];
   artist_ids: string[];
   album: string | null;

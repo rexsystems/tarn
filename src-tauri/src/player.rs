@@ -644,6 +644,30 @@ impl Player {
     pub fn hush(&self) {
         let _ = self.tx.send(Cmd::Hush);
     }
+
+    /// Stop audio and cancel in-flight play/resolve. Used when the user picks
+    /// a new mix/playlist before its tracks have loaded.
+    pub fn cut(&self) {
+        self.play_gen.fetch_add(1, Ordering::SeqCst);
+        *self.pending_adopt.lock() = None;
+        self.blending.store(false, Ordering::Relaxed);
+        self.blend_adopted.store(false, Ordering::SeqCst);
+        self.hush();
+        let mut s = self.state.lock();
+        s.playing = false;
+        s.loading = true;
+        s.error = None;
+    }
+
+    /// Set shuffle for the next `prepare` without reshuffling or restoring the
+    /// current Up next list (avoids flashing the old queue while a mix loads).
+    pub fn arm_shuffle(&self, on: bool) {
+        let mut s = self.state.lock();
+        s.shuffle = on;
+        if !on {
+            *self.linear_queue.lock() = None;
+        }
+    }
     pub fn seek(&self, secs: f64) {
         let secs = secs.max(0.0);
         let dur = self.state.lock().duration;

@@ -101,6 +101,9 @@ pub struct ShelfItem {
     pub title: String,
     pub subtitle: Option<String>,
     pub cover: Option<String>,
+    /// Up to 4 track covers for mix/playlist mosaics when header art is mixart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covers: Vec<String>,
     #[serde(default)]
     pub artists: Vec<String>,
     #[serde(default)]

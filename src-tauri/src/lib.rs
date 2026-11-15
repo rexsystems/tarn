@@ -772,6 +772,42 @@ fn set_shuffle(app: State<Arc<App>>, on: bool) {
     app.player.set_shuffle(on);
 }
 
+/// Kill current audio immediately (mix/playlist click while tracks still load).
+#[tauri::command]
+fn cut_audio(app: State<Arc<App>>) {
+    app.player.cut();
+}
+
+/// Arm shuffle for the next play without reshuffling the current queue.
+#[tauri::command]
+fn arm_shuffle(app: State<Arc<App>>, on: bool) {
+    app.player.arm_shuffle(on);
+}
+
+/// Fetch a playlist/mix and start at track 0. Cuts previous audio first so the
+/// old song does not keep playing while RD* mixes resolve.
+#[tauri::command]
+async fn play_playlist(
+    app: State<'_, Arc<App>>,
+    id: String,
+    shuffle: bool,
+) -> Result<(), String> {
+    app.player.cut();
+    app.player.arm_shuffle(shuffle);
+    let c = app.ytm.playlist(&id).await.map_err(|e| e.to_string())?;
+    if c.tracks.is_empty() {
+        return Err("This playlist has no tracks".into());
+    }
+    let track = c.tracks[0].clone();
+    let queue = c.tracks;
+    crate::diag::log(format!(
+        "play_playlist {id}: {} tracks, start={} shuffle={shuffle}",
+        queue.len(),
+        track.title
+    ));
+    start_playback(&app, track, queue, 0).await
+}
+
 #[tauri::command]
 fn set_repeat(app: State<Arc<App>>, mode: String) {
     app.player.set_repeat(&mode);
@@ -1401,6 +1437,9 @@ pub fn run() {
             set_volume,
             get_state,
             set_shuffle,
+            arm_shuffle,
+            cut_audio,
+            play_playlist,
             set_repeat,
             cycle_repeat,
             queue_add,
