@@ -23,6 +23,8 @@ enum Cmd {
     Pause,
     Resume,
     Stop,
+    /// Drop the current decoder without flipping UI phase (keeps loading).
+    Hush,
     Seek(f64),
     Volume(f32),
     Eq([f32; crate::eq::BANDS], bool),
@@ -635,6 +637,13 @@ impl Player {
     pub fn stop(&self) {
         let _ = self.tx.send(Cmd::Stop);
     }
+
+    /// Silence the mixer while `prepare` already owns the loading UI. Used on
+    /// Cut/Fresh skips so the previous track does not keep playing under the
+    /// new title while we resolve/download.
+    pub fn hush(&self) {
+        let _ = self.tx.send(Cmd::Hush);
+    }
     pub fn seek(&self, secs: f64) {
         let secs = secs.max(0.0);
         let dur = self.state.lock().duration;
@@ -1072,6 +1081,7 @@ fn audio_thread(
                 | Cmd::Gapless(..)
                 | Cmd::Cut(..)
                 | Cmd::Stop
+                | Cmd::Hush
                 | Cmd::Seek(_))
         ) {
             generation = generation.wrapping_add(1);
@@ -1182,6 +1192,7 @@ fn audio_thread(
                 }
             }
             Ok(Cmd::Stop) => mix.stop(),
+            Ok(Cmd::Hush) => mix.hush(),
             Ok(Cmd::Seek(secs)) => {
                 // Fade out so the cut isn't a pop, then swap the decoder.
                 mix.fading_out();

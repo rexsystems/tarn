@@ -124,7 +124,9 @@ impl Ytm {
                 .filter_map(|l| l.split('=').next())
                 .collect();
             crate::diag::log(format!("cookies rotated: {names:?}"));
-            Some(h.clone())
+            let out = h.clone();
+            self.players.set_cookie(Some(out.clone()));
+            Some(out)
         } else {
             None
         }
@@ -142,12 +144,15 @@ impl Ytm {
                 // Tighten rustypipe cache files if they appeared.
                 tighten_cache(&cache_dir());
                 *self.cookie.lock().unwrap() = Some(h.clone());
+                // Player clients need the same jar for age-gated / LOGIN_REQUIRED.
+                self.players.set_cookie(Some(h.clone()));
             }
             _ => {
                 let _ = self.rp.user_auth_remove_cookie().await;
                 auth::remove_file_quiet(&self.cookies_file);
                 *self.cookie.lock().unwrap() = None;
                 *self.page_id.lock().unwrap() = None;
+                self.players.set_cookie(None);
             }
         }
         Ok(())
@@ -792,43 +797,173 @@ impl Ytm {
         let bare = id.strip_prefix("VL").unwrap_or(id);
         // Liked Music / Episodes: rustypipe's music_playlist("LM") can panic
         // inside visitor-data fetch (302). Use the dedicated liked endpoints.
-        if bare == "LM" {
+        // Home also surfaces "Liked Music" as the radio seed RDAMPLLM.
+        if bare == "LM" || bare == "RDAMPLLM" {
             return self.liked_music_collection().await;
         }
         if bare == "SE" {
             return self.episodes_collection().await;
         }
-        let p = self
-            .rp
-            .query()
-            .music_playlist(id)
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
+        // Algorithmic mixes / radios (RDTMAK…, RDAMPL…): music_playlist
+        // usually 404s or returns a header-less payload. Use the radio path,
+        // then InnerTube browse, before giving up.
+        if bare.starts_with("RD") {
+            match self.mix_collection(bare).await {
+                Ok(c) if !c.tracks.is_empty() => return Ok(c),
+                Ok(_) | Err(_) => {
+                    if let Ok(c) = self.playlist_via_innertube(bare, None).await {
+                        if !c.tracks.is_empty() {
+                            return Ok(c);
+                        }
+                    }
+                }
+            }
+        }
+        match self.rp.query().music_playlist(id).await {
+            Ok(p) => {
+                let mut c = Collection {
+                    kind: "playlist".into(),
+                    id: p.id,
+                    playlist_id: None,
+                    name: p.name,
+                    cover: best_thumb(&p.thumbnail),
+                    artists: Vec::new(),
+                    artist_ids: Vec::new(),
+                    author: p.channel.as_ref().map(|c| c.name.clone()),
+                    year: None,
+                    description: p
+                        .description
+                        .as_ref()
+                        .map(|r| r.to_plaintext_yt_host("www.youtube.com")),
+                    track_count: p.track_count,
+                    album_type: None,
+                    tracks: p.tracks.items.iter().map(track_from).collect(),
+                    related: p.related_playlists.items.iter().map(playlist_from).collect(),
+                    owned: false,
+                    saved: false,
+                };
+                // rustypipe often leaves playlist album columns empty. Fill them
+                // from the InnerTube browse (third flex column) when missing.
+                if c.tracks.iter().any(|t| t.album.is_none()) {
+                    if let Err(e) = self.fill_playlist_albums(&mut c).await {
+                        eprintln!("playlist albums: {e}");
+                    }
+                }
+                stamp_missing_track_covers(&mut c);
+                Ok(c)
+            }
+            Err(e) => {
+                // User library / odd radio-adjacent playlists sometimes 400
+                // rustypipe but browse fine as VL….
+                if let Ok(c) = self.playlist_via_innertube(bare, Some(e.to_string())).await {
+                    if !c.tracks.is_empty() {
+                        return Ok(c);
+                    }
+                }
+                // Home/library "… - Radio" cards often keep a short PL id that
+                // has no shelf contents; the playable seed is RDAMPL{playlist}.
+                if bare.starts_with("PL") || bare.starts_with("OL") {
+                    let radio = format!("RDAMPL{bare}");
+                    if let Ok(mut c) = self.mix_collection(&radio).await {
+                        if !c.tracks.is_empty() {
+                            c.id = bare.to_string();
+                            c.playlist_id = Some(bare.to_string());
+                            return Ok(c);
+                        }
+                    }
+                }
+                Err(anyhow!("{e}"))
+            }
+        }
+    }
+
+    /// New Release / Archive / Discover mixes and other RD* radios.
+    async fn mix_collection(&self, radio_id: &str) -> Result<Collection> {
+        let tracks = match self.radio_id(radio_id).await {
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) | Err(_) => self.radio_playlist(radio_id).await?,
+        };
+        let tracks = dedup_tracks(tracks);
+        let n = tracks.len() as u64;
         let mut c = Collection {
             kind: "playlist".into(),
-            id: p.id,
-            playlist_id: None,
-            name: p.name,
-            cover: best_thumb(&p.thumbnail),
+            id: radio_id.into(),
+            playlist_id: Some(radio_id.into()),
+            name: "Mix".into(),
+            cover: tracks.first().and_then(|t| t.cover.clone()),
             artists: Vec::new(),
             artist_ids: Vec::new(),
-            author: p.channel.as_ref().map(|c| c.name.clone()),
+            author: None,
             year: None,
-            description: p.description.as_ref().map(|r| r.to_plaintext_yt_host("www.youtube.com")),
-            track_count: p.track_count,
+            description: None,
+            track_count: Some(n),
             album_type: None,
-            tracks: p.tracks.items.iter().map(track_from).collect(),
-            related: p.related_playlists.items.iter().map(playlist_from).collect(),
+            tracks,
+            related: Vec::new(),
             owned: false,
             saved: false,
         };
-        // rustypipe often leaves playlist album columns empty. Fill them
-        // from the InnerTube browse (third flex column) when missing.
-        if c.tracks.iter().any(|t| t.album.is_none()) {
-            if let Err(e) = self.fill_playlist_albums(&mut c).await {
-                eprintln!("playlist albums: {e}");
-            }
+        stamp_missing_track_covers(&mut c);
+        Ok(c)
+    }
+
+    async fn playlist_via_innertube(
+        &self,
+        id: &str,
+        prior: Option<String>,
+    ) -> Result<Collection> {
+        let browse_id = if id.starts_with("VL") {
+            id.to_string()
+        } else {
+            format!("VL{id}")
+        };
+        if let Some(msg) = &prior {
+            eprintln!("playlist {id}: rustypipe failed ({msg}); trying {browse_id}");
         }
+        let body = self.it().browse(&browse_id, None).await?;
+        let (mut tracks, _, _) = innertube::parse_library_page(&body);
+        // Continuations - library-style pages for big user playlists.
+        let mut tok = innertube::find_page_continuation(&body)
+            .or_else(|| innertube::find_continuation(&body));
+        for _ in 0..20 {
+            let Some(token) = tok.take() else {
+                break;
+            };
+            let Ok(more) = self.it().browse_continuation(&token).await else {
+                break;
+            };
+            let (tr, _, _) = innertube::parse_library_page(&more);
+            if tr.is_empty() {
+                break;
+            }
+            tracks.extend(tr);
+            tok = innertube::find_page_continuation(&more)
+                .or_else(|| innertube::find_continuation(&more));
+        }
+        tracks = dedup_tracks(tracks);
+        if tracks.is_empty() {
+            return Err(anyhow!("innertube browse {browse_id}: no tracks"));
+        }
+        let name = playlist_title_from_browse(&body).unwrap_or_else(|| id.to_string());
+        let n = tracks.len() as u64;
+        let mut c = Collection {
+            kind: "playlist".into(),
+            id: id.to_string(),
+            playlist_id: Some(id.to_string()),
+            name,
+            cover: tracks.first().and_then(|t| t.cover.clone()),
+            artists: Vec::new(),
+            artist_ids: Vec::new(),
+            author: None,
+            year: None,
+            description: None,
+            track_count: Some(n),
+            album_type: None,
+            tracks,
+            related: Vec::new(),
+            owned: false,
+            saved: false,
+        };
         stamp_missing_track_covers(&mut c);
         Ok(c)
     }
@@ -2054,6 +2189,22 @@ fn stamp_missing_track_covers(c: &mut Collection) {
         }
         t.ensure_cover();
     }
+}
+
+fn playlist_title_from_browse(v: &serde_json::Value) -> Option<String> {
+    for path in [
+        "/header/musicDetailHeaderRenderer/title",
+        "/header/musicEditablePlaylistDetailHeaderRenderer/header/musicDetailHeaderRenderer/title",
+        "/header/musicVisualHeaderRenderer/title",
+        "/metadata/playlistMetadataRenderer/title",
+    ] {
+        if let Some(t) = v.pointer(path).and_then(innertube::yt_text_pub) {
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
 }
 
 fn best_thumb(thumbs: &[Thumbnail]) -> Option<String> {

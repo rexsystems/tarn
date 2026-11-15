@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+use crate::auth::{sapisid_from_header, sapisidhash};
 use crate::ytm::{upgrade_cover, user_agent, Stream};
 
 const CONSENT: &str = "SOCS=CAISAiAD";
 const MUSIC_HOME: &str = "https://music.youtube.com/";
 const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+const PLAYER_ORIGIN: &str = "https://www.youtube.com";
 
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const ANDROID_UA: &str =
@@ -89,6 +91,9 @@ impl Kind {
 pub struct PlayerHub {
     http: reqwest::Client,
     visitor: Mutex<Option<(String, Instant)>>,
+    /// Signed-in Cookie header from the app session. Without this, age-gated
+    /// / LOGIN_REQUIRED tracks stay stuck on consent-only player calls.
+    cookie: Mutex<Option<String>>,
 }
 
 impl PlayerHub {
@@ -101,7 +106,39 @@ impl PlayerHub {
         Ok(Self {
             http,
             visitor: Mutex::new(None),
+            cookie: Mutex::new(None),
         })
+    }
+
+    /// Keep the player clients in sync with the app session. Never logs values.
+    pub fn set_cookie(&self, header: Option<String>) {
+        *self.cookie.lock().unwrap() = header.filter(|h| !h.is_empty());
+    }
+
+    fn has_session(&self) -> bool {
+        self.cookie
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| !h.is_empty())
+    }
+
+    /// Consent-only by default. Session jar only for age-gated retries —
+    /// putting SAPISIDHASH on every VISIONOS/ANDROID call 400s the player.
+    fn cookie_header(&self, authed: bool) -> String {
+        if !authed {
+            return CONSENT.to_string();
+        }
+        match self.cookie.lock().unwrap().as_deref() {
+            Some(h) if !h.is_empty() => {
+                if h.contains("SOCS=") {
+                    h.to_string()
+                } else {
+                    format!("{h}; {CONSENT}")
+                }
+            }
+            _ => CONSENT.to_string(),
+        }
     }
 
     pub async fn prewarm(&self) {
@@ -148,39 +185,64 @@ impl PlayerHub {
     }
 
     pub async fn player(&self, video_id: &str, kind: Kind) -> Result<Stream> {
-        let mut visitor = self.visitor_data().await?;
-        match self.player_once(video_id, kind, &visitor).await {
+        let visitor = self.visitor_data().await?;
+        match self.player_once(video_id, kind, &visitor, false).await {
+            Err(e) if e.to_string().contains("LOGIN_REQUIRED") && self.has_session() => {
+                // Age-gated: anonymous VISIONOS/ANDROID refuse it. Retry once
+                // with the signed-in jar (not on every call — that 400s).
+                crate::diag::log(format!(
+                    "player {}: LOGIN_REQUIRED, retrying with session",
+                    kind.name()
+                ));
+                self.player_once(video_id, kind, &visitor, true).await
+            }
             Err(e) if e.to_string().contains("LOGIN_REQUIRED") => {
-                // Visitor id went stale; fetch a fresh one and retry once.
+                // No session; refresh visitor once like before.
                 *self.visitor.lock().unwrap() = None;
-                visitor = self.visitor_data().await?;
-                self.player_once(video_id, kind, &visitor).await
+                let visitor = self.visitor_data().await?;
+                self.player_once(video_id, kind, &visitor, false).await
             }
             other => other,
         }
     }
 
-    async fn player_once(&self, video_id: &str, kind: Kind, visitor: &str) -> Result<Stream> {
+    async fn player_once(
+        &self,
+        video_id: &str,
+        kind: Kind,
+        visitor: &str,
+        authed: bool,
+    ) -> Result<Stream> {
         let body = json!({
             "context": { "client": kind.context(visitor) },
             "videoId": video_id,
             "contentCheckOk": true,
             "racyCheckOk": true,
         });
-        let resp = self
+        let cookie = self.cookie_header(authed);
+        let mut req = self
             .http
             .post(PLAYER_URL)
             .header("User-Agent", kind.ua())
             .header("Content-Type", "application/json")
             .header("X-YouTube-Client-Name", kind.client_id())
             .header("X-YouTube-Client-Version", kind.client_version())
-            .header("Origin", "https://www.youtube.com")
-            .header("X-Origin", "https://www.youtube.com")
+            .header("Origin", PLAYER_ORIGIN)
+            .header("X-Origin", PLAYER_ORIGIN)
             .header("X-Goog-Visitor-Id", visitor)
-            .header("Cookie", CONSENT)
-            .json(&body)
-            .send()
-            .await?;
+            .header("Cookie", &cookie);
+        if authed {
+            if let Some(sap) = sapisid_from_header(&cookie) {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                req = req
+                    .header("Authorization", sapisidhash(&sap, PLAYER_ORIGIN, ts))
+                    .header("X-Goog-AuthUser", "0");
+            }
+        }
+        let resp = req.json(&body).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {

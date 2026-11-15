@@ -1,4 +1,4 @@
-mod auth;
+pub mod auth;
 mod diag;
 mod cache;
 mod color;
@@ -479,6 +479,16 @@ pub(crate) async fn start_playback_at(
     app.apply_known_rating(&id);
     app.player.prepare(track.clone(), queue.clone(), index, start, true);
     let gen = app.player.play_gen();
+    // Cut/Fresh: don't leave the previous song audible under the new title
+    // while we resolve. Crossfade keeps the outgoing deck until play_stream.
+    if matches!(
+        style,
+        crate::player::PlayStyle::Cut
+            | crate::player::PlayStyle::Fresh
+            | crate::player::PlayStyle::Armed
+    ) {
+        app.player.hush();
+    }
 
     // Cover/accent is decorative - never block the play path on it.
     if let Some(url) = cover {
@@ -526,6 +536,8 @@ pub(crate) async fn start_playback_at(
                     if app.player.play_gen() != gen {
                         return Ok(());
                     }
+                    // Crossfade path kept the old deck; mute before we skip on.
+                    app.player.hush();
                     let msg = short_err(&e.to_string());
                     playback_failed(app, &track, msg, paused, start).await
                 }
@@ -535,6 +547,7 @@ pub(crate) async fn start_playback_at(
             if app.player.play_gen() != gen {
                 return Ok(());
             }
+            app.player.hush();
             let msg = short_err(&e.to_string());
             playback_failed(app, &track, msg, paused, start).await
         }

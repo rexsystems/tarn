@@ -1135,6 +1135,10 @@ fn walk<F: FnMut(&str, &Value)>(v: &Value, f: &mut F) {
     }
 }
 
+pub fn yt_text_pub(v: &Value) -> Option<String> {
+    yt_text(v)
+}
+
 fn yt_text(v: &Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         let s = s.trim();
@@ -1392,7 +1396,7 @@ fn response_has_account(v: &Value) -> bool {
     ok
 }
 
-fn find_page_continuation(v: &Value) -> Option<String> {
+pub fn find_page_continuation(v: &Value) -> Option<String> {
     let mut tok = None;
     walk(v, &mut |key, val| {
         if tok.is_none() && key == "sectionListRenderer" {
@@ -1444,7 +1448,7 @@ fn parse_continuation_items(v: &Value) -> (Vec<ShelfItem>, Option<String>) {
     (items, find_continuation(v))
 }
 
-fn find_continuation(v: &Value) -> Option<String> {
+pub fn find_continuation(v: &Value) -> Option<String> {
     let mut tok = None;
     walk(v, &mut |key, val| {
         if tok.is_none() {

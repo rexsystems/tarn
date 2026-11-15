@@ -385,6 +385,21 @@ impl Mixer {
         self.buffering.store(false, Ordering::Relaxed);
     }
 
+    /// Drop the playing decoder without touching phase - used while the
+    /// player UI is already in loading for the next track.
+    pub fn hush(&self) {
+        let mut g = self.inner.lock();
+        g.set_fade(0.0, CLICK_FADE * 0.7);
+        g.incoming = None;
+        g.xf_len = 0;
+        g.paused = true;
+        g.current = None;
+        g.new_current();
+        g.env = 0.0;
+        self.has_src.store(false, Ordering::Relaxed);
+        self.buffering.store(false, Ordering::Relaxed);
+    }
+
     pub fn seek_swap(&self, src: AudioSource) {
         let sr = src.sample_rate().max(1);
         let ch = src.channels().max(1);
