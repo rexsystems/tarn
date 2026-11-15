@@ -1289,9 +1289,18 @@ fn emit_loop(handle: AppHandle, app: Arc<App>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     crate::win::init();
-    // WebKitGTK compositing often blurs glyphs at fractional DPI.
-    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    // Linux WebKitGTK only. NVIDIA + Wayland's DMA-BUF path often blacks
+    // out then flickers the webview even though the app is fully alive.
+    // Overridable if the user already set these.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        // Compositing also blurs glyphs at fractional DPI on WebKitGTK.
+        if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
     }
     let app = match App::new() {
         Ok(a) => Arc::new(a),
