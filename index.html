@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tarn - a YouTube Music desktop client</title>
+  <meta name="description" content="Tarn is a fast, self-contained YouTube Music app for Linux, Windows, and macOS. Free and open source." />
+  <link rel="icon" href="favicon.png" type="image/png" />
+  <meta property="og:title" content="Tarn" />
+  <meta property="og:description" content="A fast YouTube Music desktop client." />
+  <meta property="og:image" content="logo.png" />
+  <meta name="theme-color" content="#0c0b0a" />
+  <style>
+    :root {
+      --bg: #0c0b0a;
+      --bg-elev: #181715;
+      --bg-side: #11110f;
+      --text: #f5f3f0;
+      --text-2: #c9c6c0;
+      --text-3: #9a9791;
+      --accent: #e0a45a;
+      --accent-rgb: 224, 164, 90;
+      --line: rgba(255,255,255,0.08);
+      --radius: 14px;
+      --ease: cubic-bezier(.2, .7, .2, 1);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+    body {
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { width: min(1120px, calc(100% - 48px)); margin: 0 auto; position: relative; }
+
+    /* scroll progress */
+    #bar { position: fixed; top: 0; left: 0; height: 3px; width: 100%; z-index: 100;
+      transform-origin: 0 50%; transform: scaleX(0);
+      background: linear-gradient(90deg, #b8742a, var(--accent), #ffd9a0); }
+
+    /* drifting ambient glow behind everything */
+    .aura { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; }
+    .aura i { position: absolute; border-radius: 50%; filter: blur(90px); opacity: .22; will-change: transform; }
+    .aura i:nth-child(1) { width: 620px; height: 620px; left: -160px; top: -120px; background: radial-gradient(circle, rgba(var(--accent-rgb),1), transparent 70%); }
+    .aura i:nth-child(2) { width: 520px; height: 520px; right: -140px; top: 30vh; background: radial-gradient(circle, #8a4b1d, transparent 70%); opacity: .3; }
+    .aura i:nth-child(3) { width: 460px; height: 460px; left: 30vw; bottom: -200px; background: radial-gradient(circle, #5a3a1a, transparent 70%); opacity: .35; }
+
+    header {
+      position: sticky; top: 0; z-index: 50;
+      backdrop-filter: blur(14px) saturate(1.2);
+      -webkit-backdrop-filter: blur(14px) saturate(1.2);
+      background: rgba(12,11,10,.55);
+      border-bottom: 1px solid transparent;
+      transition: border-color .3s;
+    }
+    header.stuck { border-color: var(--line); }
+    header .wrap { display: flex; align-items: center; justify-content: space-between; padding: 16px 0; }
+    .brand { display: flex; align-items: center; gap: 12px; color: var(--text); font-weight: 700; font-size: 18px; text-decoration: none; }
+    .brand img { width: 36px; height: 36px; border-radius: 9px; }
+    nav { display: flex; gap: 22px; font-size: 14px; font-weight: 550; }
+    nav a { color: var(--text-2); }
+    nav a:hover { color: var(--text); text-decoration: none; }
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      min-height: 46px; padding: 0 22px; border-radius: 23px;
+      font-weight: 650; font-size: 15px; text-decoration: none;
+      border: 1px solid transparent; cursor: pointer;
+      transition: transform .25s var(--ease), box-shadow .25s var(--ease), background .2s;
+    }
+    .btn:hover { text-decoration: none; transform: translateY(-2px); }
+    .btn-p { background: var(--accent); color: #1a1208; box-shadow: 0 8px 28px rgba(var(--accent-rgb), .28); }
+    .btn-p:hover { box-shadow: 0 12px 36px rgba(var(--accent-rgb), .45); }
+    .btn-g { background: transparent; color: var(--text); border-color: var(--line); }
+    .btn-g:hover { background: rgba(255,255,255,0.06); }
+
+    /* ---------- hero ---------- */
+    .hero { padding: 64px 0 0; text-align: center; position: relative; }
+    .eyebrow { display: inline-flex; gap: 8px; align-items: center; font-size: 13px; font-weight: 600; letter-spacing: .04em;
+      color: var(--accent); padding: 6px 14px; border: 1px solid rgba(var(--accent-rgb), .3); border-radius: 99px;
+      background: rgba(var(--accent-rgb), .07); margin-bottom: 22px; }
+    .eyebrow b { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .35; transform: scale(.7); } }
+    .hero h1 {
+      font-size: clamp(40px, 7.4vw, 88px); line-height: 1.02; letter-spacing: -0.04em; font-weight: 780; margin: 0 0 20px;
+    }
+    .grad { background: linear-gradient(100deg, #fff 10%, var(--accent) 55%, #ffd9a0 90%); -webkit-background-clip: text; background-clip: text; color: transparent;
+      background-size: 200% 100%; animation: sheen 6s linear infinite; }
+    @keyframes sheen { to { background-position: -200% 0; } }
+    .hero p.lead { font-size: 19px; color: var(--text-2); max-width: 580px; margin: 0 auto 32px; }
+    .cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+    .oses { margin-top: 18px; font-size: 13px; color: var(--text-3); }
+
+    /* 3D hero stage: three screenshots floating at different depths */
+    .stage { perspective: 1600px; margin-top: 64px; height: clamp(300px, 54vw, 640px); position: relative; }
+    .rig { position: absolute; inset: 0; transform-style: preserve-3d;
+      transform: rotateX(var(--rx, 24deg)) rotateY(var(--ry, 0deg)) translateY(var(--ty, 0px)) scale(var(--sc, .94));
+      transition: transform .12s linear; will-change: transform; }
+    .win { position: absolute; border-radius: 14px; overflow: hidden; border: 1px solid rgba(255,255,255,.12);
+      background: var(--bg-side); box-shadow: 0 40px 90px rgba(0,0,0,.6), 0 0 0 1px rgba(0,0,0,.4); }
+    .win img { display: block; width: 100%; height: auto; }
+    .win.main { left: 50%; top: 0; width: min(900px, 86%); transform: translateX(-50%) translateZ(0); }
+    .win.l { left: 0; top: 18%; width: 40%; transform: translateZ(-120px) rotateY(18deg); opacity: .9; }
+    .win.r { right: 0; top: 24%; width: 40%; transform: translateZ(-80px) rotateY(-18deg); opacity: .95; }
+    .win.main::after { content: ""; position: absolute; inset: 0; pointer-events: none;
+      background: linear-gradient(115deg, rgba(255,255,255,.1), transparent 35%); mix-blend-mode: screen; }
+    .floor { position: absolute; left: 10%; right: 10%; bottom: -30px; height: 80px;
+      background: radial-gradient(ellipse at center, rgba(var(--accent-rgb), .35), transparent 70%); filter: blur(30px); }
+
+    /* ---------- pinned scroll story ---------- */
+    .story { position: relative; height: 340vh; margin-top: 90px; }
+    .story-in { position: sticky; top: 0; height: 100vh; display: grid; grid-template-columns: 0.8fr 1.3fr; gap: 56px; align-items: center; }
+    .steps { position: relative; height: 300px; }
+    .step { position: absolute; inset: 0; opacity: 0; transform: translateY(24px); transition: opacity .5s var(--ease), transform .5s var(--ease); pointer-events: none; }
+    .step.on { opacity: 1; transform: none; pointer-events: auto; }
+    .step .no { font-size: 13px; font-weight: 700; letter-spacing: .12em; color: var(--accent); }
+    .step h2 { font-size: clamp(30px, 4vw, 48px); line-height: 1.05; letter-spacing: -0.03em; margin: 10px 0 14px; }
+    .step p { color: var(--text-2); font-size: 17px; max-width: 420px; margin: 0; }
+    .dots { position: absolute; left: 0; bottom: -40px; display: flex; gap: 8px; }
+    .dots span { width: 28px; height: 4px; border-radius: 4px; background: var(--line); transition: background .3s, width .3s; }
+    .dots span.on { background: var(--accent); width: 44px; }
+    .device { perspective: 1400px; }
+    .device .card3 { position: relative; transform-style: preserve-3d;
+      transform: rotateY(var(--dy, -14deg)) rotateX(var(--dx, 6deg)); transition: transform .15s linear;
+      border-radius: 14px; border: 1px solid rgba(255,255,255,.12); overflow: hidden;
+      box-shadow: 0 50px 100px rgba(0,0,0,.65), 30px 30px 80px rgba(var(--accent-rgb), .08); background: var(--bg-side); aspect-ratio: 1240 / 820; }
+    .card3 img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; transform: scale(1.06); transition: opacity .6s var(--ease), transform .9s var(--ease); }
+    .card3 img.on { opacity: 1; transform: none; }
+
+    /* ---------- features with 3D tilt ---------- */
+    .sec-h { text-align: center; padding: 110px 0 40px; }
+    .sec-h h2 { font-size: clamp(32px, 5vw, 56px); letter-spacing: -0.035em; line-height: 1.05; margin: 0 0 12px; }
+    .sec-h p { color: var(--text-2); font-size: 18px; margin: 0 auto; max-width: 560px; }
+    .feat { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; perspective: 1200px; }
+    .f {
+      position: relative; background: linear-gradient(160deg, var(--bg-elev), #121110); border: 1px solid var(--line);
+      border-radius: 18px; padding: 26px 24px 24px; overflow: hidden; transform-style: preserve-3d;
+      transform: rotateX(var(--tx, 0deg)) rotateY(var(--ty, 0deg));
+      transition: transform .2s var(--ease), border-color .3s, opacity .7s var(--ease);
+    }
+    .f::before { content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0; transition: opacity .3s;
+      background: radial-gradient(260px circle at var(--mx, 50%) var(--my, 0%), rgba(var(--accent-rgb), .16), transparent 60%); }
+    .f:hover { border-color: rgba(var(--accent-rgb), .35); }
+    .f:hover::before { opacity: 1; }
+    .f .ic { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 16px;
+      background: rgba(var(--accent-rgb), .12); color: var(--accent); transform: translateZ(40px); }
+    .f .ic svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .f h3 { margin: 0 0 8px; font-size: 18px; transform: translateZ(26px); }
+    .f p { margin: 0; color: var(--text-2); font-size: 14.5px; transform: translateZ(14px); }
+
+    /* ---------- big showcase band ---------- */
+    .band { margin: 110px 0 0; position: relative; }
+    .band .rowimgs { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; perspective: 1400px; }
+    .band .rowimgs .tilt { border-radius: 14px; overflow: hidden; border: 1px solid var(--line);
+      box-shadow: 0 30px 70px rgba(0,0,0,.5); transform: rotateY(var(--bry, 0deg)) translateY(var(--bty, 0px)); transition: transform .15s linear; }
+    .band img { display: block; width: 100%; }
+
+    /* ---------- cta ---------- */
+    .final { text-align: center; padding: 120px 0 90px; }
+    .final h2 { font-size: clamp(36px, 6vw, 70px); letter-spacing: -0.04em; line-height: 1.02; margin: 0 0 16px; }
+    .final p { color: var(--text-2); max-width: 520px; margin: 0 auto 30px; font-size: 18px; }
+    .final .logo3d { width: 120px; height: 120px; margin: 0 auto 28px; perspective: 700px; }
+    .final .logo3d img { width: 100%; height: 100%; border-radius: 28px; transform: rotateY(var(--ly, 0deg)) rotateX(var(--lx, 0deg));
+      box-shadow: 0 20px 70px rgba(var(--accent-rgb), .35); transition: transform .15s linear; }
+
+    footer { border-top: 1px solid var(--line); padding: 28px 0 48px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: var(--text-3); font-size: 13px; }
+
+    /* reveal on scroll */
+    .rv { opacity: 0; transform: translateY(34px); transition: opacity .8s var(--ease), transform .8s var(--ease); }
+    .rv.in { opacity: 1; transform: none; }
+    .feat .f.rv { transition: transform .2s var(--ease), border-color .3s, opacity .8s var(--ease); }
+
+    @media (max-width: 860px) {
+      .feat { grid-template-columns: 1fr; }
+      .story { height: auto; margin-top: 60px; }
+      .story-in { position: static; height: auto; grid-template-columns: 1fr; gap: 28px; }
+      .steps { height: auto; }
+      .step { position: static; opacity: 1; transform: none; margin-bottom: 26px; pointer-events: auto; }
+      .dots { display: none; }
+      .device .card3 { transform: none !important; }
+      .card3 img { opacity: 0; }
+      .card3 img:first-child { opacity: 1; transform: none; }
+      .band .rowimgs { grid-template-columns: 1fr; }
+      .win.l, .win.r { display: none; }
+      nav a:not(:last-child) { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .rv { opacity: 1; transform: none; transition: none; }
+      .grad, .eyebrow b { animation: none; }
+      .rig, .card3, .f { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="bar"></div>
+  <div class="aura" aria-hidden="true"><i></i><i></i><i></i></div>
+
+  <header id="top">
+    <div class="wrap">
+      <a class="brand" href="./">
+        <img src="logo.png" alt="" width="36" height="36" />
+        Tarn
+      </a>
+      <nav>
+        <a href="#tour">Tour</a>
+        <a href="#features">Features</a>
+        <a href="https://github.com/rexsystems/tarn">Source</a>
+        <a href="https://github.com/rexsystems/tarn/releases">Releases</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <span class="eyebrow"><b></b> Free &amp; open source</span>
+        <h1>YouTube Music,<br><span class="grad">on your desktop.</span></h1>
+        <p class="lead">Tarn is a fast, self-contained player for Linux, Windows, and macOS. Sign in with Google if you want - it works without an account too.</p>
+        <div class="cta">
+          <a class="btn btn-p" id="dl" href="https://github.com/rexsystems/tarn/releases/latest">Download Tarn</a>
+          <a class="btn btn-g" href="https://github.com/rexsystems/tarn">View the source</a>
+        </div>
+        <div class="oses" id="oses">Linux · Windows · macOS</div>
+
+        <div class="stage" id="stage">
+          <div class="rig" id="rig">
+            <div class="win l"><img src="search.png" alt="Search suggestions in Tarn" /></div>
+            <div class="win r"><img src="playing.png" alt="A track playing in Tarn" /></div>
+            <div class="win main"><img src="home.png" alt="Tarn home screen, with shelves of albums and a dark player bar" /></div>
+            <div class="floor"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- scroll story -->
+    <section class="story" id="tour">
+      <div class="story-in wrap">
+        <div class="steps" id="steps">
+          <div class="step on">
+            <div class="no">01 - HOME</div>
+            <h2>Everything you listen to, front and center.</h2>
+            <p>Shelves of albums, quick picks and mixes the moment you open it. Quiet, dark and out of your way.</p>
+          </div>
+          <div class="step">
+            <div class="no">02 - PLAYING</div>
+            <h2>Big art. Queue. Lyrics.</h2>
+            <p>Open the full-screen player for synced lyrics and Up next, with a blurred backdrop that follows the cover.</p>
+          </div>
+          <div class="step">
+            <div class="no">03 - SEARCH</div>
+            <h2>Find it before you finish typing.</h2>
+            <p>Suggestions, a top result and songs, right in the dropdown. Hit <b>/</b> from anywhere to jump in.</p>
+          </div>
+          <div class="dots" id="dots"><span class="on"></span><span></span><span></span></div>
+        </div>
+        <div class="device">
+          <div class="card3" id="card3">
+            <img class="on" src="home.png" alt="Tarn home" />
+            <img src="playing.png" alt="Tarn playing" />
+            <img src="search.png" alt="Tarn search" />
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- features -->
+    <section id="features">
+      <div class="wrap">
+        <div class="sec-h rv">
+          <h2>Small app. <span class="grad">Big feel.</span></h2>
+          <p>Built with Tauri, Rust and Svelte, so it starts fast and stays out of your RAM.</p>
+        </div>
+        <div class="feat" id="feat">
+          <div class="f rv">
+            <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/></svg></div>
+            <h3>Nothing else to install</h3>
+            <p>Audio is decoded in-process. A current yt-dlp is bundled and kept up to date. You don't need ffmpeg or any other tool.</p>
+          </div>
+          <div class="f rv">
+            <div class="ic"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5"/><path d="M12 8v4l3 2"/></svg></div>
+            <h3>Picks up where you left off</h3>
+            <p>Closing Tarn remembers the track and position, the queue, volume, shuffle and repeat, and the window itself.</p>
+          </div>
+          <div class="f rv">
+            <div class="ic"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
+            <h3>Synced lyrics</h3>
+            <p>Follow along line by line in the fullscreen player, with the queue right beside it.</p>
+          </div>
+          <div class="f rv">
+            <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/></svg></div>
+            <h3>Offline downloads</h3>
+            <p>Save playlists and liked songs to disk and keep listening when the connection drops.</p>
+          </div>
+          <div class="f rv">
+            <div class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>
+            <h3>Mini player &amp; hotkeys</h3>
+            <p>A tray mini player, configurable shortcuts and global hotkeys, so you rarely need the main window.</p>
+          </div>
+          <div class="f rv">
+            <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2l7 4v6c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6z"/></svg></div>
+            <h3>Free and open source</h3>
+            <p>Licensed under the GPL-3.0. Updates are signed and offered in the app.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- showcase -->
+    <section class="band">
+      <div class="wrap">
+        <div class="rowimgs" id="rowimgs">
+          <div class="tilt"><img src="playing.png" alt="A track playing in Tarn, with queue and artwork" loading="lazy" /></div>
+          <div class="tilt"><img src="search.png" alt="Search suggestions, a top result, and songs in the Tarn search dropdown" loading="lazy" /></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="final">
+      <div class="wrap">
+        <div class="logo3d" id="logo3d"><img src="logo.png" alt="Tarn" /></div>
+        <h2 class="rv">Hear it <span class="grad">your way.</span></h2>
+        <p class="rv">Grab the latest build for your system. It updates itself from then on.</p>
+        <div class="cta rv">
+          <a class="btn btn-p" id="dl2" href="https://github.com/rexsystems/tarn/releases/latest">Download Tarn</a>
+          <a class="btn btn-g" href="https://github.com/rexsystems/tarn">Star on GitHub</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="wrap">
+    <footer>
+      <span>© Tarn. <a href="https://github.com/rexsystems/tarn/blob/main/LICENSE">GPL-3.0</a></span>
+      <span><a href="https://github.com/rexsystems/tarn">github.com/rexsystems/tarn</a></span>
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      const $ = (s, r = document) => r.querySelector(s);
+      const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+      const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+      // OS-aware download label
+      const ua = navigator.userAgent;
+      const os = /Mac/.test(ua) ? 'macOS' : /Win/.test(ua) ? 'Windows' : /Linux|X11/.test(ua) ? 'Linux' : '';
+      if (os) {
+        $('#dl').textContent = `Download for ${os}`;
+        $('#dl2').textContent = `Download for ${os}`;
+      }
+
+      // reveal on scroll
+      const io = new IntersectionObserver((es) => {
+        for (const e of es) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      }, { threshold: 0.15 });
+      $$('.rv').forEach((el, i) => { el.style.transitionDelay = `${(i % 3) * 90}ms`; io.observe(el); });
+
+      const bar = $('#bar'), header = $('#top'), rig = $('#rig'), stage = $('#stage');
+      const story = $('#tour'), steps = $$('.step'), dots = $$('#dots span'), imgs = $$('#card3 img'), card3 = $('#card3');
+      const aura = $$('.aura i'), band = $$('#rowimgs .tilt'), logo = $('#logo3d img');
+      let pointer = { x: 0, y: 0 };
+
+      function onScroll() {
+        const y = scrollY, h = document.documentElement.scrollHeight - innerHeight;
+        bar.style.transform = `scaleX(${h > 0 ? y / h : 0})`;
+        header.classList.toggle('stuck', y > 10);
+        if (reduce) return;
+
+        // hero rig lays flat as you scroll past it
+        const r = stage.getBoundingClientRect();
+        const p = clamp(1 - (r.top + r.height * .2) / innerHeight, 0, 1); // 0 .. 1
+        rig.style.setProperty('--rx', `${24 - p * 24 + pointer.y * -4}deg`);
+        rig.style.setProperty('--ry', `${pointer.x * 7}deg`);
+        rig.style.setProperty('--ty', `${p * -30}px`);
+        rig.style.setProperty('--sc', `${.94 + p * .06}`);
+
+        // ambient glow parallax
+        aura.forEach((el, i) => { el.style.transform = `translate3d(0, ${y * (.05 + i * .04)}px, 0)`; });
+
+        // pinned story
+        const sr = story.getBoundingClientRect();
+        if (innerWidth > 860) {
+          const t = clamp(-sr.top / (sr.height - innerHeight), 0, .999);
+          const idx = Math.floor(t * steps.length);
+          steps.forEach((s, i) => s.classList.toggle('on', i === idx));
+          dots.forEach((d, i) => d.classList.toggle('on', i === idx));
+          imgs.forEach((im, i) => im.classList.toggle('on', i === idx));
+          card3.style.setProperty('--dy', `${-14 + t * 28}deg`);
+          card3.style.setProperty('--dx', `${6 - Math.abs(t - .5) * 8}deg`);
+        }
+
+        // showcase band: images swing in
+        band.forEach((el, i) => {
+          const br = el.getBoundingClientRect();
+          const q = clamp((br.top - innerHeight * .2) / innerHeight, -.5, 1);
+          el.style.setProperty('--bry', `${(i ? -1 : 1) * q * 16}deg`);
+          el.style.setProperty('--bty', `${q * 40}px`);
+        });
+      }
+
+      addEventListener('scroll', () => requestAnimationFrame(onScroll), { passive: true });
+      addEventListener('resize', onScroll);
+      onScroll();
+
+      if (reduce) return;
+
+      // mouse parallax (hero + logo)
+      addEventListener('pointermove', (e) => {
+        pointer.x = e.clientX / innerWidth - .5;
+        pointer.y = e.clientY / innerHeight - .5;
+        requestAnimationFrame(onScroll);
+        const lr = logo.getBoundingClientRect();
+        logo.style.setProperty('--ly', `${clamp((e.clientX - (lr.left + lr.width / 2)) / 18, -26, 26)}deg`);
+        logo.style.setProperty('--lx', `${clamp(-(e.clientY - (lr.top + lr.height / 2)) / 18, -26, 26)}deg`);
+      }, { passive: true });
+
+      // 3D tilt + spotlight on feature cards
+      $$('.f').forEach((el) => {
+        el.addEventListener('pointermove', (e) => {
+          const b = el.getBoundingClientRect();
+          const x = (e.clientX - b.left) / b.width, y = (e.clientY - b.top) / b.height;
+          el.style.setProperty('--ty', `${(x - .5) * 12}deg`);
+          el.style.setProperty('--tx', `${(.5 - y) * 12}deg`);
+          el.style.setProperty('--mx', `${x * 100}%`);
+          el.style.setProperty('--my', `${y * 100}%`);
+        });
+        el.addEventListener('pointerleave', () => { el.style.setProperty('--tx', '0deg'); el.style.setProperty('--ty', '0deg'); });
+      });
+    })();
+  </script>
+</body>
+</html>
