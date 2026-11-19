@@ -160,7 +160,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm run build:ci -- --target ${{ matrix.rust_target }} --bundles nsis,msi
+        run: pnpm run build:ci --target ${{ matrix.rust_target }} --bundles nsis,msi
 
       - name: Resolve bundle dir
         id: bundle
@@ -449,7 +449,7 @@ jobs:
           CI: "true"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm run build:macos:ci -- --target ${{ matrix.rust_target }}
+        run: pnpm run build:macos:ci --target ${{ matrix.rust_target }}
 
       - name: Read version
         id: meta
