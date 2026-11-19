@@ -358,5 +358,8 @@
   "{n} subscribers": "{n} abonați",
   "{n} up next": "{n} urmează",
   "Already saved": "Deja salvat",
-  "Already subscribed": "Deja abonat"
+  "Already subscribed": "Deja abonat",
+  "New playlist": "Playlist nou",
+  "Create": "Creează",
+  "Created “{name}”": "„{name}” a fost creat"
 }

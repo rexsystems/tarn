@@ -29,6 +29,7 @@
   import ContextMenu from './lib/components/ContextMenu.svelte';
   import SleepTimer from './lib/components/SleepTimer.svelte';
   import ImportPlaylist from './lib/components/ImportPlaylist.svelte';
+  import NewPlaylist from './lib/components/NewPlaylist.svelte';
   import Scrobbling from './lib/components/Scrobbling.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { Scrobbler } from './lib/scrobble';
@@ -1609,6 +1610,16 @@
   }
 
   let importOpen = $state(false);
+  /** New-playlist dialog; `vid` = song to put in it right away. */
+  let newPl = $state<{ vid?: string } | null>(null);
+  async function createPlaylist(title: string, vid?: string) {
+    try {
+      const id = await api.playlistCreate(title);
+      if (vid) await api.playlistAdd(id, vid);
+      toast(tr('Created “{name}”', { name: title }), 'info', 2200);
+      loadLibrary();
+    } catch (e) { fail(e, "Couldn't create this playlist", 'playlist'); }
+  }
 
   // Small always-on-top player window (same page, ?mini=1).
   async function openMini(at?: { x: number; y: number }) {
@@ -1669,13 +1680,8 @@
     if (!vid) return;
     if (needAccount('playlist')) return;
     if (!pid) {
-      const title = prompt('Playlist name');
-      if (!title) return;
-      try {
-        const id = await api.playlistCreate(title);
-        await api.playlistAdd(id, vid);
-        loadLibrary();
-      } catch (e) { fail(e, "Couldn't create this playlist", 'playlist'); }
+      // window.prompt is not available in the webview: use our own dialog.
+      newPl = { vid };
       return;
     }
     const name = library?.playlists?.find((p) => p.id === pid)?.name;
@@ -2454,6 +2460,7 @@
           {/if}
           {#if auth.signed_in && !off.offline}
             <div style="margin-top:20px">
+              <button class="btn ghost" type="button" onclick={() => (newPl = {})}>{tr('New playlist')}</button>
               <button class="btn ghost" type="button" onclick={() => (importOpen = true)}>{tr('Import playlist')}</button>
             </div>
           {/if}
@@ -3814,6 +3821,9 @@
 </div>
 
 <Toast />
+{#if newPl}
+  <NewPlaylist onClose={() => (newPl = null)} onCreate={(t) => createPlaylist(t, newPl?.vid)} />
+{/if}
 {#if importOpen}
   <ImportPlaylist
     onClose={() => (importOpen = false)}
