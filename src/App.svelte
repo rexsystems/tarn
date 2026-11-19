@@ -1537,18 +1537,18 @@
       out.push({ label: tr('Play next'), icon: PlayListAddIcon, onclick: () => { api.queueAdd([t], true); toast(tr('Playing next'), 'info', 1800); } });
       out.push({ label: tr('Add to queue'), icon: Queue02Icon, onclick: () => { api.queueAdd([t], false); toast(tr('Added to queue'), 'info', 1800); } });
       if (online) out.push({ label: tr('Start radio'), icon: Radio02Icon, onclick: () => startRadio(t.id) });
-      out.push({ label: 'Play', icon: PlayIcon, onclick: () => playOne(t) });
-      out.push({ label: 'Play next', icon: PlayListAddIcon, onclick: () => { api.queueAdd([t], true); toast('Playing next', 'info', 1800); } });
-      out.push({ label: 'Add to queue', icon: Queue02Icon, onclick: () => { api.queueAdd([t], false); toast('Added to queue', 'info', 1800); } });
       if (jam.info.mode === 'joined') {
         out.push({ label: "Add to host's queue", icon: Queue02Icon, onclick: () => {
           api.jamAdd(t).then(() => toast("Added to the host's queue", 'info', 1800)).catch((e) => toast(String(e), 'error', 2600));
         } });
       }
-      if (online) out.push({ label: 'Start radio', icon: Radio02Icon, onclick: () => startRadio(t.id) });
       if (online) {
         sep();
-        out.push({ label: tr('Like'), icon: FavouriteIcon, onclick: () => likeTrack(t, 'like') });
+        const likedNow = player.track?.id === t.id
+          ? player.liked
+          : isLocalLiked(t.id) || !!library?.liked?.some((x) => x.id === t.id);
+        if (likedNow) out.push({ label: tr('Liked'), icon: FavouriteFilledIcon, onclick: () => likeTrack(t, 'removelike') });
+        else out.push({ label: tr('Like'), icon: FavouriteIcon, onclick: () => likeTrack(t, 'like') });
         if (isDisliked(t.id)) out.push({ label: tr('Remove dislike'), icon: ThumbsDownIcon, onclick: () => likeTrack(t, 'removelike') });
         else out.push({ label: tr('Dislike'), icon: ThumbsDownIcon, onclick: () => likeTrack(t, 'dislike') });
         if (auth.signed_in) {
@@ -1588,6 +1588,7 @@
     }
     if (online && auth.signed_in) {
       const saved = inLibrary(k);
+      if (saved) out.push({ label: k.kind === 'artist' ? tr('Already subscribed') : tr('Already saved'), icon: CheckmarkCircle02Icon, disabled: true });
       out.push({
         label: saved ? tr('Remove from library') : k.kind === 'artist' ? tr('Subscribe') : tr('Save to library'),
         icon: Bookmark02Icon,
@@ -1997,9 +1998,11 @@
     npShow = true;
     // Phones: keep the controls on screen (no hover to bring them back).
     if (typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches) return;
-    if (expanded && !npHoverChrome) {
+    // Hide after the mouse has been still for a while, even when it rests on
+    // the lyrics or the player bar. Any movement shows it again.
+    if (expanded) {
       npHideTimer = setTimeout(() => {
-        if (expanded && !npHoverChrome && winFocused) npShow = false;
+        if (expanded && winFocused) npShow = false;
       }, 2500);
     }
   }

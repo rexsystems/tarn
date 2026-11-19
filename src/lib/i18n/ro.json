@@ -356,5 +356,7 @@
   "{n} not found": "{n} negăsite",
   "{n} plays": "{n} redări",
   "{n} subscribers": "{n} abonați",
-  "{n} up next": "{n} urmează"
+  "{n} up next": "{n} urmează",
+  "Already saved": "Deja salvat",
+  "Already subscribed": "Deja abonat"
 }
