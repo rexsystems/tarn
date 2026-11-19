@@ -98,10 +98,6 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             platform_key: windows-x86_64
             artifact_name: windows-x64
-          - runner: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            platform_key: windows-aarch64
-            artifact_name: windows-arm64
     runs-on: ${{ matrix.runner }}
     env:
       VITE_TARN_BUILD: ${{ needs.version.outputs.build }}
@@ -474,6 +470,20 @@ jobs:
           chmod +x .github/create-macos-dmg.sh
           .github/create-macos-dmg.sh "$APP" "$DMG" "Tarn"
           echo "bundle_dir=$BUNDLE" >> "$GITHUB_OUTPUT"
+
+      - name: Give updater archives an arch-specific name
+        run: |
+          # x64 and arm64 both produce Tarn.app.tar.gz; on the release they
+          # would overwrite each other (and race on upload).
+          BUNDLE="${{ steps.dmg.outputs.bundle_dir }}"
+          for f in "$BUNDLE"/macos/*.app.tar.gz; do
+            [ -e "$f" ] || continue
+            base="${f%.app.tar.gz}"
+            new="${base}_${{ steps.meta.outputs.arch_suffix }}.app.tar.gz"
+            mv "$f" "$new"
+            [ -e "$f.sig" ] && mv "$f.sig" "$new.sig"
+          done
+          ls -la "$BUNDLE"/macos
 
       - name: Write updater fragment
         id: fragment
