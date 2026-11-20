@@ -2460,7 +2460,16 @@
     }
   }
 
-  function onAppMove() {
+  let lastMove = { x: NaN, y: NaN };
+  function onAppMove(e: MouseEvent) {
+    // When the chrome fades out the layout under the cursor changes and the
+    // webview fires a mousemove without the mouse moving, which used to bring
+    // the controls straight back. Only real movement counts.
+    const x = e.screenX;
+    const y = e.screenY;
+    const moved = !(Math.abs(x - lastMove.x) < 3 && Math.abs(y - lastMove.y) < 3);
+    lastMove = { x, y };
+    if (!moved) return;
     if (expanded && winFocused) armNpHide();
   }
 
@@ -2547,8 +2556,8 @@
   <div
     class="tb-wrap"
     role="presentation"
-    onpointerenter={() => { if (expanded) { npHoverChrome = true; armNpHide(); } }}
-    onpointerleave={() => { if (expanded) { npHoverChrome = false; armNpHide(); } }}
+    onpointerenter={() => { if (expanded) npHoverChrome = true; }}
+    onpointerleave={() => { if (expanded) npHoverChrome = false; }}
   >
     <!-- Drag strip stays outside the opacity layer (WebView2). -->
     <div
@@ -4272,8 +4281,8 @@
         type="button"
         onclick={closeExpanded}
         title={tr('Close')}
-        onpointerenter={() => { npHoverChrome = true; armNpHide(); }}
-        onpointerleave={() => { npHoverChrome = false; armNpHide(); }}
+        onpointerenter={() => { npHoverChrome = true; }}
+        onpointerleave={() => { npHoverChrome = false; }}
       >
         <Hi icon={Cancel01Icon} size={26} />
       </button>
@@ -4410,8 +4419,8 @@
           aria-label={tr('Up next')}
           transition:sideReveal={{ duration: 420, x: 32 }}
           onwheel={(e) => e.stopPropagation()}
-          onpointerenter={() => { npHoverChrome = true; armNpHide(); }}
-          onpointerleave={() => { npHoverChrome = false; armNpHide(); }}
+          onpointerenter={() => { npHoverChrome = true; }}
+          onpointerleave={() => { npHoverChrome = false; }}
         >
           <div class="np-queue-h">{tr('Up next')}</div>
           <div class="np-queue-list">
@@ -4436,8 +4445,8 @@
       <div
         class="np-dock"
         class:dim={!npShow}
-        onpointerenter={() => { npHoverChrome = true; armNpHide(); }}
-        onpointerleave={() => { npHoverChrome = false; armNpHide(); }}
+        onpointerenter={() => { npHoverChrome = true; }}
+        onpointerleave={() => { npHoverChrome = false; }}
         onwheel={nudgeVolume}
       >
         <div class="np-seek">
