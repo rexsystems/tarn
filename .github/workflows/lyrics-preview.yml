@@ -5,7 +5,7 @@ on:
     branches: [feat/lyrics-styles]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   preview:
@@ -22,7 +22,13 @@ jobs:
         continue-on-error: true
         run: pnpm run check 2>&1 | tail -80
       - run: pnpm exec vite build --config preview/vite.config.ts
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: preview-dist
-          path: preview-dist
+      - name: Publish build to a scratch branch
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          cd preview-dist
+          git init -q
+          git checkout -q -b tmp/lyrics-preview
+          git add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "preview ${{ github.sha }}"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}" HEAD:tmp/lyrics-preview
