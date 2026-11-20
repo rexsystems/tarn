@@ -89,8 +89,35 @@
   const pwords = $derived(style === 'poster' ? posterWords(curText) : []);
 
   const wp = (off: number, len: number) => Math.min(1, Math.max(0, (head - off) / len));
-  /** Fisheye: letters near the middle of the line are bigger. */
-  const bulge = (k: number) => 0.72 + 0.58 * Math.sin(Math.PI * Math.min(1, Math.max(0, (k + 0.5) / nChars)));
+  /** Fisheye: the line in 1-3 balanced rows; every row bulges in the middle
+      like seen through a lens, and the middle row is the biggest. */
+  const feRows = $derived.by(() => {
+    if (style !== 'fisheye' || !words.length) return [];
+    const n = Math.min(3, Math.max(1, Math.ceil(nChars / 30)), words.length);
+    const target = nChars / n;
+    const rows: (typeof words)[] = [[]];
+    let len = 0;
+    for (const w of words) {
+      const row = rows[rows.length - 1];
+      if (row.length && rows.length < n && len + w.len / 2 > target * rows.length) rows.push([]);
+      rows[rows.length - 1].push(w);
+      len += w.len + 1;
+    }
+    return rows.map((ws, r) => {
+      const a = ws[0].off;
+      const z = ws[ws.length - 1].off + ws[ws.length - 1].len - a;
+      const rowScale = rows.length === 3 ? (r === 1 ? 1.1 : 0.9) : 1;
+      return {
+        words: ws.map((w) => ({
+          ...w,
+          b: w.chars.map((_, ci) => {
+            const x = (w.off + ci - a + 0.5) / Math.max(1, z);
+            return (rowScale * (0.7 + 0.6 * Math.sin(Math.PI * Math.min(1, Math.max(0, x))))).toFixed(3);
+          }),
+        })),
+      };
+    });
+  });
   /** Neighbour lines for the fisheye drum, nearest first. */
   const around = (dir: -1 | 1) => {
     const out: number[] = [];
@@ -182,14 +209,18 @@
     </div>
     <div class="fe-box">
       {#key slotKey}
-        <div class="fe lx-in" use:fitText={{ max: (w, h) => Math.min(h * 0.32, w * 0.075, 104) * scale, min: 14, deps }}>
+        <div class="fe lx-in" use:fitText={{ max: (w, h) => Math.min(h * 0.3, w * 0.09, 110) * scale, min: 14, deps }}>
           {#if cur >= 0 && curText}
-            {#each words as w, wi (wi)}
-              <span class="fw">{#each w.chars as ch, ci (ci)}<span
-                  class="fc"
-                  class:on={head > w.off + ci}
-                  style:--b={bulge(w.off + ci).toFixed(3)}
-                >{ch}</span>{/each}</span>{' '}
+            {#each feRows as row, ri (ri)}
+              <div class="fe-row">
+                {#each row.words as w, wi (wi)}
+                  <span class="fw">{#each w.chars as ch, ci (ci)}<span
+                      class="fc"
+                      class:on={head > w.off + ci}
+                      style:--b={w.b[ci]}
+                    >{ch}</span>{/each}</span>{' '}
+                {/each}
+              </div>
             {/each}
           {:else}
             {@render bigSlot()}
@@ -426,7 +457,9 @@
     line-height: 1.12;
     letter-spacing: -0.01em;
   }
+  .fe-row { white-space: nowrap; }
   .fw { white-space: nowrap; }
+  :global(.fit-break) .fe-row { white-space: normal; }
   /* Real font sizes (not transforms): the bulge takes up layout space, so
      bigger letters push their neighbours instead of covering them. */
   .fc {
