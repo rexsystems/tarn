@@ -17,6 +17,7 @@ mod stats;
 mod jumplist;
 mod analysis;
 mod lrclib;
+mod bgvideo;
 mod key;
 mod autodj;
 mod sponsorblock;
@@ -809,6 +810,28 @@ async fn get_playlist_head(app: State<'_, Arc<App>>, id: String) -> Result<Colle
     }
     wait_for_session(&app).await;
     app.ytm.playlist_head(&id).await.map_err(|e| e.to_string())
+}
+
+/// Music video to show behind the fullscreen player, if the song has one.
+#[tauri::command]
+async fn bg_video(
+    app: State<'_, Arc<App>>,
+    id: String,
+    is_video: bool,
+) -> Result<Option<bgvideo::BgVideo>, String> {
+    bgvideo::resolve(&app.ytm, &id, is_video)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn bg_video_cache_size() -> u64 {
+    bgvideo::cache_bytes()
+}
+
+#[tauri::command]
+fn bg_video_cache_clear() {
+    bgvideo::clear_cache();
 }
 
 #[tauri::command]
@@ -2643,6 +2666,7 @@ pub fn run() {
             .plugin(tauri_plugin_process::init());
     }
     builder
+        .register_uri_scheme_protocol("tarnvideo", |_ctx, req| bgvideo::serve(&req))
         .register_uri_scheme_protocol("tarncover", |_ctx, req| {
             let name = req
                 .uri()
@@ -2770,6 +2794,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            bg_video,
+            bg_video_cache_size,
+            bg_video_cache_clear,
             search_tracks,
             search_suggestions,
             search_all,

@@ -17,7 +17,7 @@
   import type {
     ArtistPage, AuthStatus, Collection, Explore, GenrePage, Home, Library,
     Lyrics, PlayerState, PlaylistCard, Related, SearchResults, Settings as SettingsT,
-    Shelf, ShelfItem, Track, View, CtxTarget,
+    Shelf, ShelfItem, Track, View, CtxTarget, LyricsFont, LyricsStyle,
   } from './lib/types';
   import { coverFor, itemToTrack, preloadNowCover } from './lib/cover';
   import {
@@ -44,6 +44,10 @@
   import SleepTimer from './lib/components/SleepTimer.svelte';
   import ImportPlaylist from './lib/components/ImportPlaylist.svelte';
   import NewPlaylist from './lib/components/NewPlaylist.svelte';
+  import LyricsStage from './lib/components/LyricsStage.svelte';
+  import BgVideo from './lib/components/BgVideo.svelte';
+  import LyricsLook from './lib/components/LyricsLook.svelte';
+  import { LYRICS_COLORS, LYRICS_FONTS, LYRICS_STYLES } from './lib/lyricsStyles';
   import Scrobbling from './lib/components/Scrobbling.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { Scrobbler } from './lib/scrobble';
@@ -2243,6 +2247,15 @@
     npLyricsMode && lyricsOk && !!lyrics?.synced && (lyrics?.lines.length ?? 0) > 0,
   );
   let npQueueOn = $derived(npLayer && queueOn);
+  const lyStyle = $derived(settings.lyrics_style ?? 'classic');
+  /** Full-stage lyric styles (everything but the classic scrolling column). */
+  let lyImmersive = $derived(npLyricsOn && lyStyle !== 'classic');
+  /** The music video is playing behind the fullscreen player. */
+  let bgVideoOn = $state(false);
+  let videoCache = $state(0);
+  $effect(() => {
+    if (settings.bg_video) api.bgVideoCacheSize().then((n) => (videoCache = n)).catch(() => {});
+  });
   let npLyricsEl: HTMLDivElement | null = $state(null);
 
   let scrollRaf = 0;
@@ -3871,6 +3884,85 @@
                   />
                 </div>
               </div>
+              <div class="set-row">
+                <span class="lb">{tr('Fullscreen lyrics style')}
+                  <span class="set-meta">{tr(LYRICS_STYLES.find((x) => x.id === (settings.lyrics_style ?? 'classic'))?.hint ?? '')}</span>
+                </span>
+                <Dropdown value={settings.lyrics_style ?? 'classic'} options={LYRICS_STYLES.map((x) => ({ value: x.id, label: tr(x.name) }))}
+                  onchange={(v) => { settings.lyrics_style = v as LyricsStyle; api.setSettings(settings); }} />
+              </div>
+              <div class="set-row">
+                <span class="lb">{tr('Lyrics font')}
+                  <span class="set-meta">{tr('Fullscreen only. Terminal always uses a monospace font')}</span>
+                </span>
+                <Dropdown value={settings.lyrics_font ?? 'sans'} options={LYRICS_FONTS.map((x) => ({ value: x.id, label: tr(x.name) }))}
+                  onchange={(v) => { settings.lyrics_font = v as LyricsFont; api.setSettings(settings); }} />
+              </div>
+              <div class="set-row">
+                <span class="lb">{tr('Alignment')}
+                  <span class="set-meta">{tr('Auto uses what suits each style')}</span>
+                </span>
+                <Dropdown value={settings.lyrics_align ?? 'auto'} options={[
+                  { value: 'auto', label: tr('Auto') },
+                  { value: 'left', label: tr('Left') },
+                  { value: 'center', label: tr('Center') },
+                ]} onchange={(v) => { settings.lyrics_align = v as 'auto' | 'left' | 'center'; api.setSettings(settings); }} />
+              </div>
+              <div class="set-row">
+                <span class="lb">{tr('Uppercase')}
+                  <span class="set-meta">{tr('Fullscreen lyrics in capital letters')}</span>
+                </span>
+                <Toggle checked={!!settings.lyrics_upper} label={tr('Uppercase')} onchange={(v) => { settings.lyrics_upper = v; api.setSettings(settings); }} />
+              </div>
+              <div class="set-row">
+                <span class="lb">{tr('Lyrics colour')}
+                  <span class="set-meta">{settings.lyrics_color ? tr('Fixed colour') : tr('From the cover of the song playing')}</span>
+                </span>
+                <div class="accent-pick" role="radiogroup" aria-label={tr('Lyrics colour')}>
+                  <button class="acc-sw auto" class:on={!settings.lyrics_color} title={tr('From cover art')} aria-label={tr('From cover art')}
+                    onclick={() => { settings.lyrics_color = null; api.setSettings(settings); }}></button>
+                  {#each LYRICS_COLORS as c (c)}
+                    <button class="acc-sw" class:on={settings.lyrics_color === c} style:background={c} title={c} aria-label={c}
+                      onclick={() => { settings.lyrics_color = c; api.setSettings(settings); }}></button>
+                  {/each}
+                  <label class="acc-sw custom" class:on={!!settings.lyrics_color && !LYRICS_COLORS.includes(settings.lyrics_color)} title={tr('Custom colour')}
+                    style:background={settings.lyrics_color && !LYRICS_COLORS.includes(settings.lyrics_color) ? settings.lyrics_color : null}>
+                    <input type="color" value={settings.lyrics_color ?? '#ff4fa3'}
+                      onchange={(e) => { settings.lyrics_color = (e.currentTarget as HTMLInputElement).value; api.setSettings(settings); }} />
+                  </label>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="lb">{tr('Music video in the background')}
+                  <span class="set-meta">{tr('Fullscreen only: plays the song\'s music video behind the player, not blurred, when it has one. Downloads the video (no sound)')}</span>
+                </span>
+                <Toggle checked={!!settings.bg_video} label={tr('Music video in the background')} onchange={(v) => { settings.bg_video = v; api.setSettings(settings); }} />
+              </div>
+              {#if settings.bg_video}
+                <div class="set-row">
+                  <span class="lb">{tr('Darken video')}
+                    <span class="set-meta">{Math.round(settings.bg_video_dim ?? 35)}%</span>
+                  </span>
+                  <div class="set-ctl">
+                    <Slider
+                      value={settings.bg_video_dim ?? 35}
+                      max={80}
+                      live={true}
+                      showTip={true}
+                      label={tr('Darken video')}
+                      format={(v) => `${Math.round(v)}%`}
+                      oninput={(v) => { settings.bg_video_dim = Math.round(v); }}
+                      onchange={(v) => { settings.bg_video_dim = Math.round(v); api.setSettings(settings); }}
+                    />
+                  </div>
+                </div>
+                <div class="set-row">
+                  <span class="lb">{tr('Video cache')}
+                    <span class="set-meta">{fmtBytes(videoCache)}</span>
+                  </span>
+                  <button class="btn ghost sm" type="button" onclick={async () => { await api.bgVideoCacheClear(); videoCache = 0; }}>{tr('Clear')}</button>
+                </div>
+              {/if}
             </div>
           </section>
           <section class="set-sec" id="set-storage">
@@ -4169,6 +4261,8 @@
       class:entering={npEntering}
       class:has-lyrics={npLyricsOn}
       class:has-queue={npQueueOn}
+      class:lyx-on={lyImmersive}
+      class:has-video={bgVideoOn}
       transition:npReveal
       onoutroend={onNpOutroEnd}
       onwheel={nudgeVolume}
@@ -4187,11 +4281,22 @@
         <!-- Outside the keyed stage: stays put on a skip and only swaps its image,
              so the blurred backdrop never flashes empty/half-painted. -->
         <!-- Single blurred backdrop only — dual-fading blur(56px) layers froze WebView2. -->
-        <div class="np-bg-stack">
+        <div class="np-bg-stack" class:under-video={bgVideoOn}>
           <div class="np-bg-wrap">
             <Cover src={nowCover} videoId={player.track?.id} width={320} height={200} class="np-bg" eager alt="" />
           </div>
         </div>
+        {#if settings.bg_video}
+          <BgVideo
+            trackId={player.track?.id ?? null}
+            isVideo={!!player.track?.is_video}
+            position={player.position}
+            playing={player.playing}
+            rate={settings.speed ?? 1}
+            dim={settings.bg_video_dim ?? 35}
+            onshow={(on) => (bgVideoOn = on)}
+          />
+        {/if}
         <div class="np-shade"></div>
         {#if settings.visualizer === 'bars' || settings.visualizer === 'wave'}
           <Visualizer mode={settings.visualizer} playing={player.playing} />
@@ -4202,6 +4307,33 @@
           class:slide-prev={!morphing && npSlide === 'prev'}
         >
           <div class="np-in">
+              {#if lyImmersive && lyrics && player.track}
+                <div class="lyx-head" role="presentation" oncontextmenu={(e) => { if (player.track) contextTrack(e, player.track); }}>
+                  <div class="lyx-art"><Cover src={nowCover} videoId={player.track.id} size={120} eager alt="" /></div>
+                  <div class="lyx-meta">
+                    <b>{player.track.title}</b>
+                    <span>{player.track.artists.join(', ')}</span>
+                  </div>
+                </div>
+                <LyricsStage
+                  lines={lyrics.lines}
+                  active={activeLyric}
+                  gap={gapNow}
+                  {gapP}
+                  progress={lineProgress}
+                  style={lyStyle === 'classic' ? 'spotlight' : lyStyle}
+                  font={settings.lyrics_font ?? 'sans'}
+                  upper={!!settings.lyrics_upper}
+                  align={settings.lyrics_align ?? 'auto'}
+                  color={settings.lyrics_color ?? null}
+                  scale={settings.lyrics_size / 100}
+                  karaoke={settings.lyrics_karaoke}
+                  glow={settings.lyrics_glow}
+                  title={player.track.title}
+                  artist={player.track.artists.join(', ')}
+                  onseek={(ms) => api.seek(ms / 1000)}
+                />
+              {:else}
               <div class="np-main" role="presentation" oncontextmenu={(e) => { if (player.track) contextTrack(e, player.track); }}>
                 <div class="np-art" class:xfading={morphing}>
                   {#if morphing && morphFrom}
@@ -4242,7 +4374,12 @@
                   class="np-lyrics"
                   class:no-glow={!settings.lyrics_glow}
                   class:no-blur={!settings.lyrics_blur}
+                  class:upper={!!settings.lyrics_upper}
+                  class:center={settings.lyrics_align === 'center'}
+                  class:custom={!!settings.lyrics_color}
+                  data-font={settings.lyrics_font ?? 'sans'}
                   style:--ly-scale={settings.lyrics_size / 100}
+                  style:--ly-hl={settings.lyrics_color ?? null}
                   aria-label={tr('Lyrics')}
                   bind:this={npLyricsEl}
                   onwheel={(e) => e.stopPropagation()}
@@ -4261,6 +4398,7 @@
                     >{#if i === activeLyric && gapNow < 0 && settings.lyrics_karaoke}{@render karaoke()}{:else}{ln.text || ' '}{/if}</button>
                   {/each}
                 </div>
+              {/if}
               {/if}
             </div>
           </div>
@@ -4386,6 +4524,7 @@
               title={tr('Queue')}
               btnSize="lg"
             />
+            <LyricsLook {settings} onsave={() => api.setSettings(settings)} />
             <SleepTimer
               trackId={player.track?.id ?? null}
               position={player.position}

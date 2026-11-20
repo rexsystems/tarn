@@ -263,6 +263,17 @@ export interface Settings {
   lyrics_dots: boolean;
   /** Lyrics text size, percent. */
   lyrics_size: number;
+  /** Fullscreen lyrics look. */
+  lyrics_style?: LyricsStyle;
+  lyrics_font?: LyricsFont;
+  lyrics_upper?: boolean;
+  lyrics_align?: 'auto' | 'left' | 'center';
+  /** Highlight colour; null = from the cover. */
+  lyrics_color?: string | null;
+  /** Fullscreen: music video behind the player when the song has one. */
+  bg_video?: boolean;
+  /** Darken the video background, percent 0..80. */
+  bg_video_dim?: number;
   /** Desktop frosted-glass strength 0..=100 (0 = off). */
   transparency?: number;
   /** Inset chrome panels with gaps and rounded corners. */
@@ -416,3 +427,6 @@ export interface OfflineSource {
   cover: string | null;
   subtitle: string | null;
 }
+
+export type LyricsStyle = 'classic' | 'spotlight' | 'poster' | 'bounce' | 'terminal' | 'subtitles';
+export type LyricsFont = 'sans' | 'serif' | 'mono' | 'condensed' | 'rounded';

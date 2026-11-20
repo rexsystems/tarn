@@ -4826,3 +4826,71 @@ html.extreme ::selection { background: var(--accent); color: #000; }
 :root[data-theme='light'] .ctx { background: #fff; }
 :root[data-theme='light'] .chk-box { background: var(--bg-active); }
 :root[data-theme='light'] .shimmer { background: linear-gradient(90deg, #ebe8e3 20%, #f6f4f0 45%, #ebe8e3 70%); background-size: 1200px 100%; }
+
+/* ---------- fullscreen: full-stage lyric styles (LyricsStage) ---------- */
+.np.has-lyrics.lyx-on .np-in {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: clamp(10px, 1.6vh, 18px);
+  padding-top: calc(var(--titlebar, 36px) + 14px);
+  padding-bottom: calc(var(--np-dock, 128px) + 8px);
+  padding-left: clamp(24px, 5vw, 80px);
+  padding-right: clamp(24px, 5vw, 80px);
+}
+.np.has-lyrics.lyx-on.has-queue .np-in { padding-right: min(340px, 36vw); }
+.app.np-idle .np.has-lyrics.lyx-on .np-in {
+  padding: 28px clamp(24px, 5vw, 80px) 32px;
+}
+.app.np-idle .np.has-lyrics.lyx-on.has-queue .np-in { padding-right: min(340px, 36vw); }
+.lyx-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  /* The close button sits at the top right. */
+  max-width: calc(100% - 72px);
+  height: 52px;
+  overflow: hidden;
+  transition: opacity 0.5s var(--ease), height 0.55s var(--ease);
+}
+.app.np-idle .lyx-head { opacity: 0; height: 0; }
+.lyx-art {
+  flex: none;
+  width: 52px;
+  height: 52px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg-elev);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.lyx-art :is(img, .ph) { width: 100%; height: 100%; object-fit: cover; display: block; }
+.lyx-meta { display: flex; flex-direction: column; min-width: 0; }
+.lyx-meta b,
+.lyx-meta span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lyx-meta b { font-size: 15px; line-height: 20px; font-weight: 700; }
+.lyx-meta span { font-size: 13px; line-height: 18px; color: rgba(255, 255, 255, 0.62); }
+
+/* Music video background: the blurred cover and the veil step aside. */
+.np-bg-stack,
+.np-shade { transition: opacity 0.7s ease; }
+.np-bg-stack.under-video,
+.np.has-video .np-shade { opacity: 0; }
+
+/* Classic column: the look settings apply here too. */
+.np-lyrics.upper .ly { text-transform: uppercase; }
+.np-lyrics.center .ly {
+  text-align: center;
+  transform-origin: center center;
+  margin-left: auto;
+  margin-right: auto;
+}
+.np-lyrics.custom .ly.on { color: var(--ly-hl); }
+.np-lyrics.custom .kc {
+  color: color-mix(in srgb, var(--ly-hl) calc(var(--c) * 100%), rgba(245, 243, 240, 0.38));
+}
+.np-lyrics[data-font='serif'] .ly { font-family: 'Iowan Old Style', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, 'Times New Roman', serif; }
+.np-lyrics[data-font='mono'] .ly { font-family: ui-monospace, 'Cascadia Code', 'JetBrains Mono', 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace; }
+.np-lyrics[data-font='condensed'] .ly { font-family: Bahnschrift, 'Arial Narrow', 'Roboto Condensed', 'Helvetica Neue', 'DejaVu Sans Condensed', sans-serif; font-stretch: 75%; }
+.np-lyrics[data-font='rounded'] .ly { font-family: ui-rounded, 'SF Pro Rounded', Nunito, 'Varela Round', 'Arial Rounded MT Bold', ui-sans-serif, system-ui, sans-serif; }

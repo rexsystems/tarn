@@ -27,6 +27,19 @@ export interface JamInfo {
   error: string | null;
 }
 
+/** Song time -> video time for a song's music video. */
+export interface VideoSeg {
+  primary_ms: number;
+  counterpart_ms: number;
+  duration_ms: number;
+}
+
+export interface BgVideo {
+  file: string;
+  video_id: string;
+  segments: VideoSeg[];
+}
+
 export const api = {
   searchAll: (query: string) => invoke<SearchResults>('search_all', { query }),
   searchTracks: (query: string) => invoke<Track[]>('search_tracks', { query }),
@@ -46,6 +59,9 @@ export const api = {
   playlist: (id: string) => invoke<Collection>('get_playlist', { id }),
   playlistHead: (id: string) => invoke<Collection>('get_playlist_head', { id }),
   lyrics: (id: string) => invoke<Lyrics>('get_lyrics', { id }),
+  bgVideo: (id: string, isVideo: boolean) => invoke<BgVideo | null>('bg_video', { id, isVideo }),
+  bgVideoCacheSize: () => invoke<number>('bg_video_cache_size'),
+  bgVideoCacheClear: () => invoke<void>('bg_video_cache_clear'),
   related: (id: string) => invoke<Related>('get_related', { id }),
   trackWave: (id: string) => invoke<number[] | null>('track_wave', { id }),
   outputDevices: () => invoke<{ devices: string[]; default: string | null; current: string | null }>('output_devices'),

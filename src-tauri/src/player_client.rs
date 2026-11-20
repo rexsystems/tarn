@@ -50,7 +50,7 @@ impl Kind {
         }
     }
 
-    fn ua(self) -> &'static str {
+    pub(crate) fn ua(self) -> &'static str {
         match self {
             Kind::VisionOs => VISIONOS_UA,
             Kind::Android => ANDROID_UA,
@@ -192,6 +192,41 @@ impl PlayerHub {
     }
 
     async fn player_once(&self, video_id: &str, kind: Kind, visitor: &str) -> Result<Stream> {
+        let v = self.player_json(video_id, kind, visitor).await?;
+        let stream = pick_aac(&v, kind).ok_or_else(|| {
+            anyhow!(
+                "player {}: no AAC url (sabr-only or empty)",
+                kind.name()
+            )
+        })?;
+        crate::diag::log(format!(
+            "player {}: {} itag={:?} clen={:?}",
+            kind.name(),
+            video_id,
+            stream.itag(),
+            url_query(&stream.url, "clen")
+        ));
+        Ok(stream)
+    }
+
+    /// A video-only stream for the fullscreen background (H.264 preferred,
+    /// at most 720p). Tries VISIONOS, then ANDROID.
+    pub async fn video(&self, video_id: &str) -> Result<(VideoSrc, Kind)> {
+        let visitor = self.visitor_data().await?;
+        let mut last = None;
+        for kind in [Kind::VisionOs, Kind::Android] {
+            match self.player_json(video_id, kind, &visitor).await {
+                Ok(v) => match pick_video(&v) {
+                    Some(src) => return Ok((src, kind)),
+                    None => last = Some(anyhow!("player {}: no video url", kind.name())),
+                },
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("no video stream")))
+    }
+
+    async fn player_json(&self, video_id: &str, kind: Kind, visitor: &str) -> Result<Value> {
         let body = json!({
             "context": { "client": kind.context(visitor) },
             "videoId": video_id,
@@ -232,20 +267,7 @@ impl PlayerHub {
                 .unwrap_or(play);
             return Err(anyhow!("player {}: {play} ({reason})", kind.name()));
         }
-        let stream = pick_aac(&v, kind).ok_or_else(|| {
-            anyhow!(
-                "player {}: no AAC url (sabr-only or empty)",
-                kind.name()
-            )
-        })?;
-        crate::diag::log(format!(
-            "player {}: {} itag={:?} clen={:?}",
-            kind.name(),
-            video_id,
-            stream.itag(),
-            url_query(&stream.url, "clen")
-        ));
-        Ok(stream)
+        Ok(v)
     }
 
     async fn visitor_data(&self) -> Result<String> {
@@ -399,6 +421,62 @@ fn pick_aac(v: &Value, kind: Kind) -> Option<Stream> {
         client: kind.name(),
         expire,
     })
+}
+
+/// A downloadable video-only format.
+#[derive(Clone, Debug)]
+pub struct VideoSrc {
+    pub url: String,
+    pub mime: String,
+    /// Bytes, from `contentLength` or the `clen` query parameter.
+    pub len: Option<u64>,
+    pub height: u64,
+}
+
+/// Best video-only format for a background: H.264 (plays in every webview)
+/// at <= 720p and <= 30 fps when available, VP9 as a fallback.
+fn pick_video(v: &Value) -> Option<VideoSrc> {
+    let arr = v.pointer("/streamingData/adaptiveFormats")?.as_array()?;
+    let mut best: Option<((u8, u64, u8), VideoSrc)> = None;
+    for f in arr {
+        let Some(url) = f.get("url").and_then(|x| x.as_str()).filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let mime = f.get("mimeType").and_then(|x| x.as_str()).unwrap_or("");
+        if !mime.starts_with("video/") {
+            continue;
+        }
+        let codec = if mime.contains("avc1") {
+            2
+        } else if mime.contains("vp9") || mime.contains("vp09") {
+            1
+        } else {
+            continue;
+        };
+        let height = f.get("height").and_then(|x| x.as_u64()).unwrap_or(0);
+        if height == 0 || height > 720 {
+            continue;
+        }
+        let fps = f.get("fps").and_then(|x| x.as_u64()).unwrap_or(30);
+        let len = f
+            .get("contentLength")
+            .and_then(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_u64()))
+            .or_else(|| url_query(url, "clen").and_then(|s| s.parse().ok()));
+        // Codec first, then resolution, then prefer <= 30 fps (smaller).
+        let rank = (codec, height, u8::from(fps <= 30));
+        if best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            best = Some((
+                rank,
+                VideoSrc {
+                    url: url.to_string(),
+                    mime: mime.split(';').next().unwrap_or("video/mp4").to_string(),
+                    len,
+                    height,
+                },
+            ));
+        }
+    }
+    best.map(|(_, s)| s)
 }
 
 fn url_query(url: &str, key: &str) -> Option<String> {

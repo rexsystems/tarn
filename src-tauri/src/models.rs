@@ -422,6 +422,27 @@ pub struct Settings {
     /// Lyrics text size, percent (70..=150).
     #[serde(default = "default_pct")]
     pub lyrics_size: f64,
+    /// Fullscreen lyrics look: "classic" | "spotlight" | "poster" | "bounce"
+    /// | "terminal" | "subtitles".
+    #[serde(default = "default_lyrics_style")]
+    pub lyrics_style: String,
+    /// "sans" | "serif" | "mono" | "condensed" | "rounded".
+    #[serde(default = "default_lyrics_font")]
+    pub lyrics_font: String,
+    #[serde(default)]
+    pub lyrics_upper: bool,
+    /// "auto" (each style's own) | "left" | "center".
+    #[serde(default = "default_lyrics_align")]
+    pub lyrics_align: String,
+    /// Highlight colour for the sung words; None = from the cover.
+    #[serde(default)]
+    pub lyrics_color: Option<String>,
+    /// Fullscreen: play the song's music video behind the player when it has one.
+    #[serde(default)]
+    pub bg_video: bool,
+    /// How much to darken the video background, percent (0..=80).
+    #[serde(default = "default_bg_video_dim")]
+    pub bg_video_dim: f64,
     /// Desktop frosted-glass strength 0..=100 (0 = off). Older builds stored a bool.
     #[serde(default, deserialize_with = "de_transparency")]
     pub transparency: u8,
@@ -492,6 +513,13 @@ impl Default for Settings {
             lyrics_blur: true,
             lyrics_dots: true,
             lyrics_size: 100.0,
+            lyrics_style: default_lyrics_style(),
+            lyrics_font: default_lyrics_font(),
+            lyrics_upper: false,
+            lyrics_align: default_lyrics_align(),
+            lyrics_color: None,
+            bg_video: false,
+            bg_video_dim: default_bg_video_dim(),
             visualizer: default_visualizer(),
             transparency: 0,
             floating_ui: false,
@@ -564,6 +592,18 @@ fn default_bpm_return() -> f64 {
 }
 fn default_speed() -> f64 {
     1.0
+}
+fn default_lyrics_style() -> String {
+    "classic".into()
+}
+fn default_lyrics_font() -> String {
+    "sans".into()
+}
+fn default_lyrics_align() -> String {
+    "auto".into()
+}
+fn default_bg_video_dim() -> f64 {
+    35.0
 }
 fn default_visualizer() -> String {
     "off".into()

@@ -179,6 +179,18 @@ impl Ytm {
         Ok(())
     }
 
+    /// Song <-> music video pair for the fullscreen video background.
+    pub async fn counterpart(
+        &self,
+        video_id: &str,
+    ) -> Result<Option<(String, Vec<crate::bgvideo::VideoSeg>)>> {
+        self.it().counterpart(video_id).await
+    }
+
+    pub fn player_hub(&self) -> &PlayerHub {
+        &self.players
+    }
+
     fn it(&self) -> InnerTube {
         let cookie = self.cookie_header();
         let (lang, region) = self.request_locale(cookie.as_deref());

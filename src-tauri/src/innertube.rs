@@ -194,6 +194,25 @@ impl InnerTube {
         self.post("browse", json!({ "continuation": token })).await
     }
 
+    /// The other half of a song/music-video pair (YouTube Music's Song/Video
+    /// switch) and how their timelines line up, if YouTube links one.
+    pub async fn counterpart(
+        &self,
+        video_id: &str,
+    ) -> Result<Option<(String, Vec<crate::bgvideo::VideoSeg>)>> {
+        let v = self
+            .post(
+                "next",
+                json!({
+                    "videoId": video_id,
+                    "enablePersistentPlaylistPanel": true,
+                    "isAudioOnly": true,
+                }),
+            )
+            .await?;
+        Ok(parse_counterpart(&v, video_id))
+    }
+
     /// Tracks of an auto mix / radio playlist (RDTMAK..., RDMM..., RDCLAK...).
     /// YouTube Music plays these through `next`, not `browse`.
     pub async fn mix_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
@@ -1296,6 +1315,62 @@ pub fn durations_by_video(v: &Value) -> std::collections::HashMap<String, u32> {
     map
 }
 
+fn ms_of(v: &Value) -> Option<f64> {
+    v.as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| v.as_f64())
+}
+
+/// Counterpart video id + segment map for `video_id` in a `next` response.
+fn parse_counterpart(v: &Value, video_id: &str) -> Option<(String, Vec<crate::bgvideo::VideoSeg>)> {
+    let mut found = None;
+    walk(v, &mut |key, val| {
+        if found.is_some() || key != "playlistPanelVideoWrapperRenderer" {
+            return;
+        }
+        let primary = val
+            .pointer("/primaryRenderer/playlistPanelVideoRenderer/videoId")
+            .and_then(|x| x.as_str());
+        if primary != Some(video_id) {
+            return;
+        }
+        let Some(list) = val.get("counterpart").and_then(|x| x.as_array()) else {
+            return;
+        };
+        for c in list {
+            let Some(id) = c
+                .pointer("/counterpartRenderer/playlistPanelVideoRenderer/videoId")
+                .and_then(|x| x.as_str())
+                .filter(|id| id.len() == 11 && *id != video_id)
+            else {
+                continue;
+            };
+            let mut segs = Vec::new();
+            if let Some(arr) = c.pointer("/segmentMap/segment").and_then(|x| x.as_array()) {
+                for g in arr {
+                    let (Some(p), Some(q), Some(d)) = (
+                        ms_of(&g["primaryVideoStartTimeMilliseconds"]),
+                        ms_of(&g["counterpartVideoStartTimeMilliseconds"]),
+                        ms_of(&g["durationMilliseconds"]),
+                    ) else {
+                        continue;
+                    };
+                    if d > 0.0 {
+                        segs.push(crate::bgvideo::VideoSeg {
+                            primary_ms: p,
+                            counterpart_ms: q,
+                            duration_ms: d,
+                        });
+                    }
+                }
+            }
+            found = Some((id.to_string(), segs));
+            return;
+        }
+    });
+    found
+}
+
 fn walk<F: FnMut(&str, &Value)>(v: &Value, f: &mut F) {
     match v {
         Value::Object(m) => {
@@ -2137,6 +2212,28 @@ fn dedup_artists(mut v: Vec<ArtistCard>) -> Vec<ArtistCard> {
 mod continuation_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn counterpart_with_segment_map() {
+        let v = json!({"contents": {"x": [{
+            "playlistPanelVideoWrapperRenderer": {
+                "primaryRenderer": {"playlistPanelVideoRenderer": {"videoId": "AAAAAAAAAAA"}},
+                "counterpart": [{
+                    "counterpartRenderer": {"playlistPanelVideoRenderer": {"videoId": "BBBBBBBBBBB"}},
+                    "segmentMap": {"segment": [{
+                        "primaryVideoStartTimeMilliseconds": "0",
+                        "counterpartVideoStartTimeMilliseconds": "4200",
+                        "durationMilliseconds": "180000"
+                    }]}
+                }]
+            }
+        }]}});
+        let (id, segs) = parse_counterpart(&v, "AAAAAAAAAAA").unwrap();
+        assert_eq!(id, "BBBBBBBBBBB");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].counterpart_ms, 4200.0);
+        assert!(parse_counterpart(&v, "CCCCCCCCCCC").is_none());
+    }
 
     #[test]
     fn ignores_reload_continuation_data() {
