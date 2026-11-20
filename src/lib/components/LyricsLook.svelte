@@ -123,6 +123,7 @@
             <span class="ll-prev" aria-hidden="true">
               {#if s.id === 'classic'}<i></i><b>Aa</b><i></i>
               {:else if s.id === 'spotlight'}<i></i><b>Aa</b><i></i>
+              {:else if s.id === 'fisheye'}<i class="t"></i><b><small>a</small>A<small>a</small></b><i class="b"></i>
               {:else if s.id === 'poster'}<b>Aa</b><em>BB</em>
               {:else if s.id === 'bounce'}<b>A</b><b class="up">a</b><b>a</b>
               {:else if s.id === 'terminal'}<b>›_</b>
@@ -295,6 +296,11 @@
   .st-classic .ll-prev { align-items: flex-start; padding-left: 10px; }
   .st-classic .ll-prev b { font-size: 13px; }
   .st-spotlight .ll-prev b { font-size: 20px; }
+  .st-fisheye .ll-prev { perspective: 80px; }
+  .st-fisheye .ll-prev b { font-size: 22px; }
+  .st-fisheye .ll-prev small { font-size: 13px; }
+  .st-fisheye .ll-prev .t { transform: rotateX(40deg); }
+  .st-fisheye .ll-prev .b { transform: rotateX(-40deg); }
   .st-poster .ll-prev { flex-direction: row; gap: 4px; }
   .st-poster .ll-prev em { font-style: normal; font-weight: 900; font-size: 12px; padding: 1px 3px; border-radius: 3px; background: rgb(var(--accent-rgb)); color: var(--accent-fg, #111); transform: rotate(-4deg); }
   .st-bounce .ll-prev { flex-direction: row; gap: 1px; }

@@ -428,5 +428,5 @@ export interface OfflineSource {
   subtitle: string | null;
 }
 
-export type LyricsStyle = 'classic' | 'spotlight' | 'poster' | 'bounce' | 'terminal' | 'subtitles';
+export type LyricsStyle = 'classic' | 'spotlight' | 'fisheye' | 'poster' | 'bounce' | 'terminal' | 'subtitles';
 export type LyricsFont = 'sans' | 'serif' | 'mono' | 'condensed' | 'rounded';

@@ -89,6 +89,18 @@
   const pwords = $derived(style === 'poster' ? posterWords(curText) : []);
 
   const wp = (off: number, len: number) => Math.min(1, Math.max(0, (head - off) / len));
+  /** Fisheye: letters near the middle of the line are bigger. */
+  const bulge = (k: number) => 0.72 + 0.58 * Math.sin(Math.PI * Math.min(1, Math.max(0, (k + 0.5) / nChars)));
+  /** Neighbour lines for the fisheye drum, nearest first. */
+  const around = (dir: -1 | 1) => {
+    const out: number[] = [];
+    let i = (cur >= 0 ? cur : gap >= 0 ? (dir < 0 ? gap : gap - 1) : active) + dir;
+    for (; i >= 0 && i < lines.length && out.length < 2; i += dir) if (has(i)) out.push(i);
+    return out;
+  };
+  const above = $derived(around(-1).reverse());
+  const below = $derived(around(1));
+
   /** Little jump of the letter being sung right now (bounce). */
   const hop = (k: number) => (karaoke ? Math.max(0, 1 - Math.abs(head - k - 0.5) / 1.6) : 0);
 
@@ -161,6 +173,34 @@
           <button type="button" class="sp-line lx-fade" onclick={() => seek(nextIdx)}>{lines[nextIdx].text}</button>
         {/key}
       {/if}
+    </div>
+  {:else if style === 'fisheye'}
+    <div class="fe-side fe-top">
+      {#each above as i, k (i)}
+        <button type="button" class="fe-line" style:--d={above.length - k} onclick={() => seek(i)}>{lines[i].text}</button>
+      {/each}
+    </div>
+    <div class="fe-box">
+      {#key slotKey}
+        <div class="fe lx-in" use:fitText={{ max: (w, h) => Math.min(h * 0.32, w * 0.075, 104) * scale, min: 14, deps }}>
+          {#if cur >= 0 && curText}
+            {#each words as w, wi (wi)}
+              <span class="fw">{#each w.chars as ch, ci (ci)}<span
+                  class="fc"
+                  class:on={head > w.off + ci}
+                  style:--b={bulge(w.off + ci).toFixed(3)}
+                >{ch}</span>{/each}</span>{' '}
+            {/each}
+          {:else}
+            {@render bigSlot()}
+          {/if}
+        </div>
+      {/key}
+    </div>
+    <div class="fe-side fe-bot">
+      {#each below as i, k (i)}
+        <button type="button" class="fe-line" style:--d={k + 1} onclick={() => seek(i)}>{lines[i].text}</button>
+      {/each}
     </div>
   {:else if style === 'poster'}
     <div class="po-box">
@@ -344,6 +384,59 @@
     letter-spacing: -0.02em;
   }
   .lx-spotlight .sp-prev { margin-bottom: 4px; }
+
+  /* ---------- fisheye: the line bulges, neighbours curve away ---------- */
+  .fe-side {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    perspective: 520px;
+    font-size: calc(clamp(15px, 1.8vw, 26px) * var(--lx-scale));
+    line-height: 1.45;
+    font-weight: 700;
+  }
+  .fe-line {
+    display: block;
+    width: 100%;
+    height: 1.45em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: rgba(255, 255, 255, calc(0.5 - var(--d) * 0.15));
+    /* Tilted away like the edge of a lens; the edge nearest the big line
+       stays put, so the tilt can only shrink the line inside its own row. */
+    transform: rotateX(calc(var(--d) * 26deg)) scale(calc(1 - var(--d) * 0.1));
+    transition: color 0.2s;
+  }
+  .fe-top .fe-line { transform-origin: 50% 100%; }
+  .fe-bot .fe-line { transform-origin: 50% 0%; transform: rotateX(calc(var(--d) * -26deg)) scale(calc(1 - var(--d) * 0.1)); }
+  .fe-line:hover { color: rgba(255, 255, 255, 0.75); }
+  .fe-box {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 0.3em 0;
+  }
+  .fe {
+    flex: none;
+    width: 100%;
+    font-weight: 800;
+    line-height: 1.12;
+    letter-spacing: -0.01em;
+  }
+  .fw { white-space: nowrap; }
+  /* Real font sizes (not transforms): the bulge takes up layout space, so
+     bigger letters push their neighbours instead of covering them. */
+  .fc {
+    display: inline-block;
+    font-size: calc(var(--b) * 1em);
+    color: var(--lx-off);
+    transition: color 0.18s ease;
+  }
+  .fc.on { color: var(--lx-on); }
+  .glow .fc.on { text-shadow: 0 0 0.3em var(--lx-glow); }
 
   /* ---------- poster: words stacked like a gig poster ---------- */
   .po-box,

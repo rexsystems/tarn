@@ -11,7 +11,7 @@ mkdirSync(out, { recursive: true });
 const base = pathToFileURL(path.join(dist, 'index.html')).href;
 
 const sizes = [[900, 620], [1240, 820], [1920, 1080], [2560, 1440]];
-const styles = ['spotlight', 'poster', 'bounce', 'terminal', 'subtitles'];
+const styles = ['spotlight', 'fisheye', 'poster', 'bounce', 'terminal', 'subtitles'];
 const cases = [
   { tag: 'l1', q: 'line=1&p=0.6' },
   { tag: 'l2long', q: 'line=2&p=0.4' },
@@ -59,7 +59,7 @@ for (const [w, h] of sizes) {
           }
         }
         // Word boxes inside one line must not overlap each other.
-        const boxes = [...stage.querySelectorAll('.lw, .pw, .bw, .sp-line, .bo-next .sp-line')].map((e) => ({ t: e.textContent, r: e.getBoundingClientRect() }));
+        const boxes = [...stage.querySelectorAll('.lw, .pw, .bw, .fw, .fe-line, .sp-line, .bo-next .sp-line')].map((e) => ({ t: e.textContent, r: e.getBoundingClientRect() }));
         for (let i = 0; i < boxes.length; i++)
           for (let j = i + 1; j < boxes.length; j++) {
             const a = boxes[i].r, b = boxes[j].r;
