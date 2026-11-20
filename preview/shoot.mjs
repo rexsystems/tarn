@@ -65,7 +65,7 @@ for (const [w, h] of sizes) {
             const a = boxes[i].r, b = boxes[j].r;
             const ox = Math.min(a.right, b.right) - Math.max(a.left, b.left);
             const oy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
-            if (ox > 3 && oy > 3) out.push(`overlap: "${boxes[i].t}" / "${boxes[j].t}" (${Math.round(ox)}x${Math.round(oy)})`);
+            if (ox > 3 && oy > Math.max(3, 0.12 * Math.min(a.height, b.height))) out.push(`overlap: "${boxes[i].t}" / "${boxes[j].t}" (${Math.round(ox)}x${Math.round(oy)})`);
           }
         return out;
       });

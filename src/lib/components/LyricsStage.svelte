@@ -395,16 +395,17 @@
   .bo {
     flex: none;
     width: 100%;
-    padding-top: 0.24em;
+    padding-top: 0.2em;
     font-weight: 800;
-    line-height: 1.18;
+    /* Room between rows so a hopping letter never touches the row above. */
+    line-height: 1.42;
     letter-spacing: -0.01em;
   }
   .bw { white-space: nowrap; }
   .bc {
     display: inline-block;
     color: var(--lx-off);
-    transform: translateY(calc(var(--hop) * -0.22em)) scale(calc(1 + var(--hop) * 0.08));
+    transform: translateY(calc(var(--hop) * -0.16em)) scale(calc(1 + var(--hop) * 0.06));
     transition: color 0.18s ease;
     animation: lx-letter 0.5s cubic-bezier(0.22, 1, 0.36, 1) backwards;
     animation-delay: calc(min(var(--k), 40) * 12ms);
@@ -417,6 +418,7 @@
   }
   .bo-next {
     flex: none;
+    margin-top: 10px;
     height: calc(clamp(16px, 1.8vw, 24px) * var(--lx-scale) * 1.5);
     font-size: calc(clamp(16px, 1.8vw, 24px) * var(--lx-scale));
     line-height: 1.5;
@@ -425,9 +427,12 @@
   }
 
   /* ---------- terminal: typed out, line by line ---------- */
+  .lx-terminal { justify-content: flex-end; }
   .tm {
-    flex: 1 1 auto;
-    min-height: 0;
+    /* Grows upwards with the history, up to the whole stage. */
+    flex: 0 1 auto;
+    min-height: min(100%, 52%);
+    max-height: 100%;
     width: min(100%, 1100px);
     margin: 0 auto;
     display: flex;
@@ -437,7 +442,7 @@
     background: rgba(10, 10, 12, 0.62);
     border: 1px solid rgba(255, 255, 255, 0.08);
     box-shadow: 0 24px 64px -20px rgba(0, 0, 0, 0.6);
-    font-size: calc(clamp(17px, 2.1vw, 34px) * var(--lx-scale));
+    font-size: calc(clamp(20px, 2.7vw, 46px) * var(--lx-scale));
     text-align: left;
   }
   .tm-bar {
@@ -475,7 +480,7 @@
     overflow-wrap: anywhere;
     text-align: left;
   }
-  .tl.past { color: rgba(255, 255, 255, 0.4); font-size: 0.82em; }
+  .tl.past { color: rgba(255, 255, 255, 0.38); font-size: 0.66em; }
   .tl.past:hover { color: rgba(255, 255, 255, 0.7); }
   .pr { color: var(--lx-hl); margin-right: 0.6em; font-weight: 700; }
   .tl.cur { color: var(--lx-on); font-weight: 600; }
