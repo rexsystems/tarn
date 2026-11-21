@@ -91,3 +91,7 @@ jobs:
       - name: cargo clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -W clippy::correctness
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib
