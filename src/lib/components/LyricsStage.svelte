@@ -691,15 +691,10 @@
     color: var(--lx-off);
     transform: translateY(calc(var(--hop) * -0.16em)) scale(calc(1 + var(--hop) * 0.06));
     transition: color 0.18s ease;
-    animation: lx-letter 0.5s cubic-bezier(0.22, 1, 0.36, 1) backwards;
-    animation-delay: calc(min(var(--k), 40) * 12ms);
   }
   .bc.on { color: var(--lx-on); }
   .lx:not(.custom) .bc.on { color: color-mix(in srgb, var(--lx-hl) 35%, #fff); }
   .glow .bc.on { text-shadow: 0 0 0.3em var(--lx-glow); }
-  @keyframes lx-letter {
-    from { opacity: 0; translate: 0 0.5em; }
-  }
   .bo-next {
     flex: none;
     margin-top: 10px;
@@ -796,9 +791,18 @@
     width: 100%;
     font-weight: 700;
     line-height: 1.2;
-    filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.85)) drop-shadow(0 0 1px rgba(0, 0, 0, 0.9));
+  }
+  /* text-shadow, not a drop-shadow filter: a filter re-renders the whole
+     line every frame while the words fill. */
+  .lx-subtitles .lw,
+  .lx-subtitles .lw::after,
+  .lx-subtitles .lx-note {
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.85), 0 0 2px rgba(0, 0, 0, 0.9);
   }
   .lx-subtitles .lw { color: rgba(255, 255, 255, 0.55); }
+  .lx-subtitles.glow .lw.on::after {
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.85), 0 0 0.32em var(--lx-glow);
+  }
   .sb-next {
     flex: none;
     height: calc(clamp(15px, 1.6vw, 22px) * var(--lx-scale) * 1.6);
@@ -810,11 +814,11 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    filter: drop-shadow(0 1px 4px rgba(0, 0, 0, 0.8));
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .lx-in, .lx-fade, .bc { animation: none; }
+    .lx-in, .lx-fade { animation: none; }
     .bc { transform: none; }
     .caret { animation: none; }
   }
