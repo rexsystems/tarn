@@ -453,5 +453,10 @@
   "Copy code": "Copiază codul",
   "Code": "Cod",
   "Lens": "Sferă",
-  "Seen through a glass sphere, lines roll over it": "Ca printr-o sferă de sticlă, versurile se rostogolesc peste ea"
+  "Seen through a glass sphere, lines roll over it": "Ca printr-o sferă de sticlă, versurile se rostogolesc peste ea",
+  "AutoMix": "AutoMix",
+  "AutoMix: mixing…": "AutoMix: mixează…",
+  "AutoMix on: songs blend like a DJ set": "AutoMix pornit: melodiile se mixează ca la un DJ",
+  "AutoMix off": "AutoMix oprit",
+  "Blends songs like a DJ: picks the moment (outro, bar lines) and length for every song, matches tempo without changing the key, lines up the beats and swaps the bass. Overrides the crossfade settings below while on": "Mixează melodiile ca un DJ: alege momentul (outro, începutul unei măsuri) și lungimea pentru fiecare melodie, potrivește tempo-ul fără să schimbe tonalitatea, aliniază bătăile și face schimbul de bas. Cât e pornit, înlocuiește setările de crossfade de mai jos"
 }

@@ -1,4 +1,5 @@
 mod auth;
+mod automix;
 mod diag;
 mod cache;
 mod offline;
@@ -160,9 +161,10 @@ impl App {
         };
         let player = Player::start();
         player.set_autoplay(settings.autoplay);
+        player.set_automix(settings.automix);
         player.set_crossfade(
-            settings.crossfade,
-            settings.crossfade_seconds,
+            settings.xf_on(),
+            settings.xf_secs(),
             settings.album_continuity,
             settings.crossfade_manual,
         );
@@ -2078,9 +2080,10 @@ fn set_settings(app: State<Arc<App>>, handle: AppHandle, settings: Settings) {
     *app.notify.lock() = settings.notifications;
     *app.discord.lock() = settings.discord_presence;
     app.player.set_autoplay(settings.autoplay);
+    app.player.set_automix(settings.automix);
     app.player.set_crossfade(
-        settings.crossfade,
-        settings.crossfade_seconds,
+        settings.xf_on(),
+        settings.xf_secs(),
         settings.album_continuity,
         settings.crossfade_manual,
     );

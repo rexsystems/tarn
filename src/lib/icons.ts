@@ -110,3 +110,17 @@ export const MiniPlayerIcon = [
 export { Forward01Icon } from '@hugeicons/core-free-icons';
 export { MagicWand01Icon } from '@hugeicons/core-free-icons';
 export { UserGroupIcon } from '@hugeicons/core-free-icons';
+
+/** AutoMix: two records blending into each other. */
+export const AutoMixIcon = [
+  [
+    'circle',
+    { cx: '8.5', cy: '12', r: '5.5', stroke: 'currentColor', strokeWidth: '1.5', fill: 'none', key: '0' },
+  ],
+  [
+    'circle',
+    { cx: '15.5', cy: '12', r: '5.5', stroke: 'currentColor', strokeWidth: '1.5', fill: 'none', key: '1' },
+  ],
+  ['circle', { cx: '8.5', cy: '12', r: '1', fill: 'currentColor', key: '2' }],
+  ['circle', { cx: '15.5', cy: '12', r: '1', fill: 'currentColor', key: '3' }],
+] as const;

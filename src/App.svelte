@@ -69,7 +69,7 @@
   import { fail, authPrompt, toast } from './lib/toast';
   import { friendlyError, isAuthError } from './lib/errors';
   import { localLikes, isLocalLiked, setLocalLiked, localRecents, recordRecent, localSearchHistory, recordSearch, removeSearch, loadSidePanel, saveSidePanel, type SidePanelId } from './lib/local';
-  import {Home01Icon, Search01Icon, Compass01Icon, LibraryIcon, Settings02Icon, PlayIcon, PauseIcon, PreviousIcon, NextIcon, ShuffleIcon, RepeatIcon, RepeatOne01Icon, VolumeHighIcon, VolumeMute01Icon, FavouriteIcon, FavouriteFilledIcon, ThumbsDownIcon, Queue02Icon, Radio02Icon, Cancel01Icon, HistoryIcon, UserCircle02Icon, Logout03Icon, Login03Icon, MicVocalIcon, Bookmark02Icon, Notification01Icon, DiscordIcon, Globe02Icon, LanguageCircleIcon, Album02Icon, Playlist01Icon, MusicNote01Icon, SlidersHorizontalIcon, Download04Icon, ChartColumnIcon, Forward01Icon, WifiOff01Icon, CheckmarkCircle02Icon, Delete02Icon, MagicWand01Icon, PlayListAddIcon, Link01Icon, UserIcon, Add01Icon, ArrowRight01Icon, Share01Icon, MiniPlayerIcon, AudioWave01Icon, PaintBoardIcon, MoreHorizontalIcon} from './lib/icons';
+  import {Home01Icon, Search01Icon, Compass01Icon, LibraryIcon, Settings02Icon, PlayIcon, PauseIcon, PreviousIcon, NextIcon, ShuffleIcon, RepeatIcon, RepeatOne01Icon, VolumeHighIcon, VolumeMute01Icon, FavouriteIcon, FavouriteFilledIcon, ThumbsDownIcon, Queue02Icon, Radio02Icon, Cancel01Icon, HistoryIcon, UserCircle02Icon, Logout03Icon, Login03Icon, MicVocalIcon, Bookmark02Icon, Notification01Icon, DiscordIcon, Globe02Icon, LanguageCircleIcon, Album02Icon, Playlist01Icon, MusicNote01Icon, SlidersHorizontalIcon, Download04Icon, ChartColumnIcon, Forward01Icon, WifiOff01Icon, CheckmarkCircle02Icon, Delete02Icon, MagicWand01Icon, PlayListAddIcon, Link01Icon, UserIcon, Add01Icon, ArrowRight01Icon, Share01Icon, MiniPlayerIcon, AudioWave01Icon, PaintBoardIcon, MoreHorizontalIcon, AutoMixIcon} from './lib/icons';
   import { applyTheme, applyTransparency, applyFloating, ACCENTS, hexRgb, type Theme } from './lib/theme';
 
   const isMac =
@@ -1372,6 +1372,13 @@
   });
   /** Live audio-crossfade morph only (no per-tick client tween — that froze WebView2). */
   let xfading = $derived(player.xfade != null && !!player.xfade_from);
+  /** AutoMix is blending two songs right now. */
+  let autoMixing = $derived(!!settings.automix && xfading);
+  function toggleAutoMix() {
+    settings.automix = !settings.automix;
+    api.setSettings(settings);
+    toast(settings.automix ? tr('AutoMix on: songs blend like a DJ set') : tr('AutoMix off'), 'info', 2200);
+  }
   let xfP = $derived(player.xfade ?? 0);
   let xfFromCover = $derived.by(() => {
     const t = player.xfade_from;
@@ -2525,7 +2532,7 @@
     }
     if (npPrevId && id !== npPrevId) {
       morphDir = idx < npPrevIndex ? 'prev' : 'next';
-      npSlide = xfading || settings.crossfade ? null : morphDir;
+      npSlide = xfading || (settings.crossfade || settings.automix) ? null : morphDir;
     }
     npPrevId = id;
     npPrevIndex = idx;
@@ -3509,6 +3516,12 @@
           <section class="set-sec" id="set-transitions">
             <div class="set-h"><h2>{tr('Transitions')}</h2><p>{tr('Crossfade, tempo matching and Auto-DJ')}</p></div>
             <div class="set-card">
+          <div class="set-row">
+            <span class="lb"><Hi icon={AutoMixIcon} size={20} /> {tr('AutoMix')}
+              <span class="set-meta">{tr('Blends songs like a DJ: picks the moment (outro, bar lines) and length for every song, matches tempo without changing the key, lines up the beats and swaps the bass. Overrides the crossfade settings below while on')}</span>
+            </span>
+            <Toggle checked={!!settings.automix} label={tr('AutoMix')} onchange={(v) => { settings.automix = v; api.setSettings(settings); }} />
+          </div>
           <div class="set-row">
             <span class="lb"><Hi icon={MusicNote01Icon} size={20} /> {tr('Crossfade')}</span>
             <Toggle bind:checked={settings.crossfade} label={tr('Crossfade')} onchange={() => api.setSettings(settings)} />
@@ -4533,6 +4546,15 @@
               title={tr('Queue')}
               btnSize="lg"
             />
+            <IconBtn
+              class="automix-btn {autoMixing ? 'mixing' : ''}"
+              icon={AutoMixIcon}
+              size={22}
+              on={!!settings.automix}
+              onclick={toggleAutoMix}
+              title={autoMixing ? tr('AutoMix: mixing…') : tr('AutoMix')}
+              btnSize="lg"
+            />
             <LyricsLook {settings} onsave={() => api.setSettings(settings)} />
             <SleepTimer
               trackId={player.track?.id ?? null}
@@ -4691,6 +4713,15 @@
         <div class="right-c">
           {#if player.error}<span class="err">{friendlyError(player.error, "Can't play this track")}</span>{/if}
           {#if player.loading && !player.playing}<div class="spin"></div>{/if}
+          <IconBtn
+            class="rc-mid automix-btn {autoMixing ? 'mixing' : ''}"
+            icon={AutoMixIcon}
+            size={22}
+            on={!!settings.automix}
+            onclick={toggleAutoMix}
+            title={autoMixing ? tr('AutoMix: mixing…') : tr('AutoMix')}
+            btnSize="lg"
+          />
           <IconBtn
             class="rc-mid"
             icon={Queue02Icon}
