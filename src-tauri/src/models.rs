@@ -422,7 +422,7 @@ pub struct Settings {
     /// Lyrics text size, percent (70..=150).
     #[serde(default = "default_pct")]
     pub lyrics_size: f64,
-    /// Fullscreen lyrics look: "classic" | "spotlight" | "fisheye" | "poster" | "bounce"
+    /// Fullscreen lyrics look: "classic" | "spotlight" | "fisheye" | "lens" | "poster" | "bounce"
     /// | "terminal" | "subtitles".
     #[serde(default = "default_lyrics_style")]
     pub lyrics_style: String,

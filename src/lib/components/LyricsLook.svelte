@@ -124,6 +124,7 @@
               {#if s.id === 'classic'}<i></i><b>Aa</b><i></i>
               {:else if s.id === 'spotlight'}<i></i><b>Aa</b><i></i>
               {:else if s.id === 'fisheye'}<i class="t"></i><b><small>a</small>A<small>a</small></b><i class="b"></i>
+              {:else if s.id === 'lens'}<span class="lens-ball"><i></i><b>Aa</b><i></i></span>
               {:else if s.id === 'poster'}<b>Aa</b><em>BB</em>
               {:else if s.id === 'bounce'}<b>A</b><b class="up">a</b><b>a</b>
               {:else if s.id === 'terminal'}<b>›_</b>
@@ -301,6 +302,13 @@
   .st-fisheye .ll-prev small { font-size: 13px; }
   .st-fisheye .ll-prev .t { transform: rotateX(40deg); }
   .st-fisheye .ll-prev .b { transform: rotateX(-40deg); }
+  .st-lens .ll-prev .lens-ball {
+    width: 40px; height: 40px; border-radius: 50%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    background: radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.04) 60%);
+  }
+  .st-lens .ll-prev .lens-ball i { width: 60%; height: 2px; }
+  .st-lens .ll-prev .lens-ball b { font-size: 16px; }
   .st-poster .ll-prev { flex-direction: row; gap: 4px; }
   .st-poster .ll-prev em { font-style: normal; font-weight: 900; font-size: 12px; padding: 1px 3px; border-radius: 3px; background: rgb(var(--accent-rgb)); color: var(--accent-fg, #111); transform: rotate(-4deg); }
   .st-bounce .ll-prev { flex-direction: row; gap: 1px; }

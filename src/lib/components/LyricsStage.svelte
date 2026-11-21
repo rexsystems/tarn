@@ -128,6 +128,98 @@
   const above = $derived(around(-1).reverse());
   const below = $derived(around(1));
 
+  // ---------- lens: everything seen through a glass sphere ----------
+  /** Lines around the current one (2 before, 2 after). */
+  const lensLines = $derived.by(() => {
+    if (style !== 'lens') return [];
+    const mid = cur >= 0 ? cur : gap >= 0 ? gap : Math.max(0, active);
+    const out: number[] = [];
+    for (let i = mid - 1, n = 0; i >= 0 && n < 2; i--) if (has(i)) { out.unshift(i); n++; }
+    if (cur >= 0 && has(cur)) out.push(cur);
+    for (let i = cur >= 0 ? cur + 1 : mid, n = 0; i < lines.length && n < 2; i++) if (has(i)) { out.push(i); n++; }
+    return out;
+  });
+  /** Where the instrumental dots sit among the lens lines. */
+  const lensDotsAt = $derived(cur < 0 ? lensLines.findIndex((i) => i >= (gap >= 0 ? gap : active + 1)) : -2);
+  const splitLine = (i: number) => {
+    let k = 0;
+    return lines[i].text
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((w) => {
+        const chars = Array.from(w).map((ch) => ({ ch, k: k++ }));
+        k++;
+        return chars;
+      });
+  };
+  let lensEl = $state<HTMLElement | null>(null);
+  /** Last on-screen place of each letter, so letters glide from there. */
+  let lensPrev = new WeakMap<Element, { x: number; y: number; vx: number; vy: number }>();
+  const LENS_K = 0.85;
+  const lf = (u: number) => ((1 + LENS_K) * u) / (1 + LENS_K * u);
+  const lfd = (u: number) => (1 + LENS_K) / ((1 + LENS_K * u) * (1 + LENS_K * u));
+
+  /** Barrel-map every letter: positions pushed out from the centre and
+      scaled by the local magnification (big in the middle, squeezed at the
+      edges). The mapping is monotonic in x and y, so letters can't overlap. */
+  function lensMap() {
+    const root = lensEl;
+    const box = root?.parentElement;
+    if (!root || !box) return;
+    const W = box.clientWidth;
+    const H = box.clientHeight;
+    if (W < 20 || H < 20) return;
+    const cx = W / 2;
+    const cy = H / 2;
+    const items = Array.from(root.querySelectorAll<HTMLElement>('.lc'));
+    // Read everything first (one layout), then write.
+    const geo = items.map((el) => {
+      const fs = parseFloat(getComputedStyle(el).fontSize) || 16;
+      return { el, x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2, fs };
+    });
+    const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const next = new WeakMap<Element, { x: number; y: number; vx: number; vy: number }>();
+    for (const g of geo) {
+      const ux = Math.max(-1, Math.min(1, (g.x - cx) / cx));
+      const uy = Math.max(-1, Math.min(1, (g.y - cy) / cy));
+      const tx = cx + Math.sign(ux) * lf(Math.abs(ux)) * cx;
+      const ty = cy + Math.sign(uy) * lf(Math.abs(uy)) * cy;
+      const sx = lfd(Math.abs(ux));
+      const sy = lfd(Math.abs(uy));
+      const target = `translate(${(tx - g.x).toFixed(1)}px, ${(ty - g.y).toFixed(1)}px) scale(${sx.toFixed(3)}, ${sy.toFixed(3)})`;
+      const was = lensPrev.get(g.el);
+      next.set(g.el, { x: tx, y: ty, vx: g.fs * sx, vy: g.fs * sy });
+      if (!was || reduce) {
+        g.el.style.transition = 'none';
+        g.el.style.transform = target;
+        continue;
+      }
+      // FLIP: start where the letter was on screen, at its old size...
+      g.el.style.transition = 'none';
+      g.el.style.transform = `translate(${(was.x - g.x).toFixed(1)}px, ${(was.y - g.y).toFixed(1)}px) scale(${(was.vx / g.fs).toFixed(3)}, ${(was.vy / g.fs).toFixed(3)})`;
+      g.el.dataset.to = target;
+    }
+    lensPrev = next;
+    // ...then glide to the new place in one go.
+    void root.offsetWidth;
+    for (const g of geo) {
+      const to = g.el.dataset.to;
+      if (!to) continue;
+      delete g.el.dataset.to;
+      g.el.style.transition = '';
+      g.el.style.transform = to;
+    }
+  }
+  /** Measure the plain layout: transforms would count as overflow. */
+  function lensReset() {
+    for (const el of lensEl?.querySelectorAll<HTMLElement>('.lc') ?? []) {
+      el.style.transition = 'none';
+      el.style.transform = 'none';
+    }
+  }
+  const lensDeps = $derived([lensLines.join(','), cur, lensDotsAt, font, upper, scale, style]);
+
   /** Little jump of the letter being sung right now (bounce). */
   const hop = (k: number) => (karaoke ? Math.max(0, 1 - Math.abs(head - k - 0.5) / 1.6) : 0);
 
@@ -232,6 +324,28 @@
       {#each below as i, k (i)}
         <button type="button" class="fe-line" style:--d={k + 1} onclick={() => seek(i)}>{lines[i].text}</button>
       {/each}
+    </div>
+  {:else if style === 'lens'}
+    <div class="ln-box">
+      <div
+        class="ln"
+        bind:this={lensEl}
+        use:fitText={{ max: (w, h) => Math.min(h * 0.15, w * 0.06, 84) * scale, min: 12, deps: lensDeps, before: lensReset, after: lensMap }}
+      >
+        {#each lensLines as li, n (li)}
+          {#if n === lensDotsAt}
+            <div class="ln-line ln-gap"><span class="lc">{@render dots()}</span></div>
+          {/if}
+          <div class="ln-line" class:cur={li === cur} class:past={li < (cur >= 0 ? cur : gap >= 0 ? gap : active + 1)}>
+            {#each splitLine(li) as word, wi (wi)}
+              <span class="lnw">{#each word as c (c.k)}<span class="lc" class:on={li === cur && head > c.k}>{c.ch}</span>{/each}</span>{' '}
+            {/each}
+          </div>
+        {/each}
+        {#if lensDotsAt === -1 && cur < 0}
+          <div class="ln-line ln-gap"><span class="lc">{@render dots()}</span></div>
+        {/if}
+      </div>
     </div>
   {:else if style === 'poster'}
     <div class="po-box">
@@ -470,6 +584,65 @@
   }
   .fc.on { color: var(--lx-on); }
   .glow .fc.on { text-shadow: 0 0 0.3em var(--lx-glow); }
+
+  /* ---------- lens: a glass sphere over the lyrics ---------- */
+  .ln-box {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    overflow: hidden;
+  }
+  /* A faint glass ball behind the text sells the sphere. */
+  .ln-box::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: min(96%, 150vh);
+    aspect-ratio: 1;
+    translate: -50% -50%;
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at 36% 30%, rgba(255, 255, 255, 0.1), transparent 42%),
+      radial-gradient(circle, transparent 58%, rgba(0, 0, 0, 0.22) 100%);
+    pointer-events: none;
+  }
+  .ln {
+    position: static;
+    flex: none;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.12em;
+    font-weight: 750;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+  }
+  .lx.left .ln { align-items: flex-start; }
+  .ln-line {
+    max-width: 100%;
+    text-align: inherit;
+    font-size: 0.6em;
+    color: rgba(255, 255, 255, 0.34);
+  }
+  .ln-line.cur { font-size: 1em; color: var(--lx-off); }
+  .ln-line.past { color: rgba(255, 255, 255, 0.26); }
+  .lnw { white-space: nowrap; }
+  :global(.fit-break) .lnw { white-space: normal; }
+  .lc {
+    display: inline-block;
+    transform-origin: 50% 50%;
+    transition:
+      transform 0.62s cubic-bezier(0.22, 1, 0.36, 1),
+      color 0.2s ease;
+    animation: lx-fade 0.5s ease backwards;
+  }
+  .ln-line.cur .lc.on { color: var(--lx-on); }
+  .glow .ln-line.cur .lc.on { text-shadow: 0 0 0.3em var(--lx-glow); }
 
   /* ---------- poster: words stacked like a gig poster ---------- */
   .po-box,

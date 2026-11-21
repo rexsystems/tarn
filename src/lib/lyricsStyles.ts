@@ -4,6 +4,7 @@ export const LYRICS_STYLES: { id: LyricsStyle; name: string; hint: string }[] = 
   { id: 'classic', name: 'Classic', hint: 'Scrolling column next to the cover' },
   { id: 'spotlight', name: 'Spotlight', hint: 'One big line, neighbours above and below' },
   { id: 'fisheye', name: 'Fisheye', hint: 'Lines bulge out like through a lens' },
+  { id: 'lens', name: 'Lens', hint: 'Seen through a glass sphere, lines roll over it' },
   { id: 'poster', name: 'Poster', hint: 'Words stacked like a gig poster' },
   { id: 'bounce', name: 'Bounce', hint: 'Every letter hops as it is sung' },
   { id: 'terminal', name: 'Terminal', hint: 'Typed out line by line' },

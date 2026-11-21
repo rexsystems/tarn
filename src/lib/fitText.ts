@@ -13,6 +13,10 @@ export interface FitOpts {
   min?: number;
   /** Anything that changes the text's layout (text, font, case, scale...). */
   deps?: unknown;
+  /** Runs before measuring (e.g. to drop transforms that would skew it). */
+  before?: () => void;
+  /** Runs after every fit, with the final size applied. */
+  after?: () => void;
 }
 
 export function fitText(node: HTMLElement, opts: FitOpts) {
@@ -22,6 +26,12 @@ export function fitText(node: HTMLElement, opts: FitOpts) {
 
   function run() {
     raf = 0;
+    o.before?.();
+    fit();
+    o.after?.();
+  }
+
+  function fit() {
     if (!box) return;
     const cs = getComputedStyle(box);
     const aw = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
