@@ -26,7 +26,21 @@
   let active = $state(Number(q.get('line') ?? '1'));
   if (q.has('step')) setTimeout(() => (active += 1), 1000);
   const gap = Number(q.get('gap') ?? '-1');
-  const progress = Number(q.get('p') ?? '0.6');
+  let progress = $state(Number(q.get('p') ?? '0.6'));
+  // `anim`: run like the app (progress every frame, new line every 3 s).
+  if (q.has('anim')) {
+    let t0 = performance.now();
+    const tick = (t: number) => {
+      const e = (t - t0) / 3000;
+      if (e >= 1) {
+        t0 = t;
+        active = (active + 1) % lines.length;
+      }
+      progress = Math.min(1, e);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
 </script>
 
 <div class="np" class:idle class:queue>
