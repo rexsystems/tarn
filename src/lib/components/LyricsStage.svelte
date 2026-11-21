@@ -154,15 +154,17 @@
       });
   };
   let lensEl = $state<HTMLElement | null>(null);
-  /** Last on-screen place of each letter, so letters glide from there. */
-  let lensPrev = new WeakMap<Element, { x: number; y: number; vx: number; vy: number }>();
-  const LENS_K = 0.85;
-  const lf = (u: number) => ((1 + LENS_K) * u) / (1 + LENS_K * u);
-  const lfd = (u: number) => (1 + LENS_K) / ((1 + LENS_K * u) * (1 + LENS_K * u));
+  let lensLastKey = '';
+  /** Vertical / horizontal strength. Softer sideways so edges stay readable. */
+  const LENS_KY = 0.85;
+  const LENS_KX = 0.6;
+  const lf = (u: number, k: number) => ((1 + k) * u) / (1 + k * u);
+  const lfd = (u: number, k: number) => (1 + k) / ((1 + k * u) * (1 + k * u));
 
   /** Barrel-map every letter: positions pushed out from the centre and
       scaled by the local magnification (big in the middle, squeezed at the
-      edges). The mapping is monotonic in x and y, so letters can't overlap. */
+      edges). The mapping is monotonic in x and y, so letters can't overlap.
+      A new line rolls the whole sphere at once (letters never cross). */
   function lensMap() {
     const root = lensEl;
     const box = root?.parentElement;
@@ -174,49 +176,35 @@
     const cy = H / 2;
     const items = Array.from(root.querySelectorAll<HTMLElement>('.lc'));
     // Read everything first (one layout), then write.
-    const geo = items.map((el) => {
-      const fs = parseFloat(getComputedStyle(el).fontSize) || 16;
-      return { el, x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2, fs };
-    });
-    const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const next = new WeakMap<Element, { x: number; y: number; vx: number; vy: number }>();
+    const geo = items.map((el) => ({ el, x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2 }));
     for (const g of geo) {
       const ux = Math.max(-1, Math.min(1, (g.x - cx) / cx));
       const uy = Math.max(-1, Math.min(1, (g.y - cy) / cy));
-      const tx = cx + Math.sign(ux) * lf(Math.abs(ux)) * cx;
-      const ty = cy + Math.sign(uy) * lf(Math.abs(uy)) * cy;
-      const sx = lfd(Math.abs(ux));
-      const sy = lfd(Math.abs(uy));
-      const target = `translate(${(tx - g.x).toFixed(1)}px, ${(ty - g.y).toFixed(1)}px) scale(${sx.toFixed(3)}, ${sy.toFixed(3)})`;
-      const was = lensPrev.get(g.el);
-      next.set(g.el, { x: tx, y: ty, vx: g.fs * sx, vy: g.fs * sy });
-      if (!was || reduce) {
-        g.el.style.transition = 'none';
-        g.el.style.transform = target;
-        continue;
-      }
-      // FLIP: start where the letter was on screen, at its old size...
-      g.el.style.transition = 'none';
-      g.el.style.transform = `translate(${(was.x - g.x).toFixed(1)}px, ${(was.y - g.y).toFixed(1)}px) scale(${(was.vx / g.fs).toFixed(3)}, ${(was.vy / g.fs).toFixed(3)})`;
-      g.el.dataset.to = target;
+      const tx = cx + Math.sign(ux) * lf(Math.abs(ux), LENS_KX) * cx;
+      const ty = cy + Math.sign(uy) * lf(Math.abs(uy), LENS_KY) * cy;
+      const sx = lfd(Math.abs(ux), LENS_KX);
+      const sy = lfd(Math.abs(uy), LENS_KY);
+      g.el.style.transform = `translate(${(tx - g.x).toFixed(1)}px, ${(ty - g.y).toFixed(1)}px) scale(${sx.toFixed(3)}, ${sy.toFixed(3)})`;
     }
-    lensPrev = next;
-    // ...then glide to the new place in one go.
-    void root.offsetWidth;
-    for (const g of geo) {
-      const to = g.el.dataset.to;
-      if (!to) continue;
-      delete g.el.dataset.to;
-      g.el.style.transition = '';
-      g.el.style.transform = to;
+    const key = `${lensLines.join(',')}|${cur}|${lensDotsAt}`;
+    if (key !== lensLastKey) {
+      const first = lensLastKey === '';
+      lensLastKey = key;
+      const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!first && !reduce && typeof root.animate === 'function') {
+        root.animate(
+          [
+            { transform: 'translateY(9%) scale(0.97)', opacity: 0.35 },
+            { transform: 'none', opacity: 1 },
+          ],
+          { duration: 520, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+        );
+      }
     }
   }
   /** Measure the plain layout: transforms would count as overflow. */
   function lensReset() {
-    for (const el of lensEl?.querySelectorAll<HTMLElement>('.lc') ?? []) {
-      el.style.transition = 'none';
-      el.style.transform = 'none';
-    }
+    for (const el of lensEl?.querySelectorAll<HTMLElement>('.lc') ?? []) el.style.transform = 'none';
   }
   const lensDeps = $derived([lensLines.join(','), cur, lensDotsAt, font, upper, scale, style]);
 
@@ -636,10 +624,7 @@
   .lc {
     display: inline-block;
     transform-origin: 50% 50%;
-    transition:
-      transform 0.62s cubic-bezier(0.22, 1, 0.36, 1),
-      color 0.2s ease;
-    animation: lx-fade 0.5s ease backwards;
+    transition: color 0.2s ease;
   }
   .ln-line.cur .lc.on { color: var(--lx-on); }
   .glow .ln-line.cur .lc.on { text-shadow: 0 0 0.3em var(--lx-glow); }
