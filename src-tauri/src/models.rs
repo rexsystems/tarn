@@ -398,6 +398,10 @@ pub struct Settings {
     /// Reorder upcoming tracks by tempo so transitions flow (no shuffle).
     #[serde(default)]
     pub auto_dj: bool,
+    /// One switch for DJ-style transitions: crossfade timed per song (outro,
+    /// bar lines), tempo matching with keylock, beat alignment, bass swap.
+    #[serde(default)]
+    pub automix: bool,
     /// Auto-DJ also weighs musical key (Camelot wheel) when ordering.
     #[serde(default)]
     pub harmonic_mix: bool,
@@ -506,6 +510,7 @@ impl Default for Settings {
             normalize: false,
             normalize_target: default_normalize_target(),
             auto_dj: false,
+            automix: false,
             harmonic_mix: false,
             lyrics_karaoke: true,
             lyrics_lrclib: true,
@@ -542,7 +547,30 @@ fn de_transparency<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Erro
 
 impl Settings {
     /// The crossfade configuration the player uses, clamped to sane ranges.
+    /// Crossfading is on (by itself or through AutoMix).
+    pub fn xf_on(&self) -> bool {
+        self.crossfade || self.automix
+    }
+
+    /// Crossfade length for skips and as AutoMix's fallback.
+    pub fn xf_secs(&self) -> f64 {
+        if self.automix {
+            self.crossfade_seconds.clamp(4.0, 10.0)
+        } else {
+            self.crossfade_seconds
+        }
+    }
+
     pub fn transition(&self) -> crate::transition::XfConfig {
+        let base = self.manual_transition();
+        if self.automix {
+            crate::automix::config(&base)
+        } else {
+            base
+        }
+    }
+
+    fn manual_transition(&self) -> crate::transition::XfConfig {
         use crate::transition::{Curve, FilterSweep, XfConfig, XfShape};
         XfConfig {
             shape: XfShape {

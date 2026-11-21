@@ -113,6 +113,8 @@ pub struct Player {
     audible: Arc<Mutex<String>>,
     /// Auto-DJ wants upcoming tracks analysed.
     auto_dj: Arc<AtomicBool>,
+    /// AutoMix: per-transition timing chosen from the outgoing track.
+    automix: Arc<AtomicBool>,
     waveform: Arc<AtomicBool>,
     /// Live crossfade progress‰ from the mixer (0 = idle).
     xf_milli: Arc<AtomicU32>,
@@ -243,6 +245,7 @@ impl Player {
             normalize: Arc::new(Mutex::new(None)),
             audible: Arc::new(Mutex::new(String::new())),
             auto_dj: Arc::new(AtomicBool::new(false)),
+            automix: Arc::new(AtomicBool::new(false)),
             waveform: Arc::new(AtomicBool::new(false)),
             xf_milli,
             xfade_from,
@@ -628,12 +631,21 @@ impl Player {
         self.normalize.lock().is_some()
             || self.xf_cfg.lock().bpm_match
             || self.auto_dj.load(Ordering::Relaxed)
+            || self.automix.load(Ordering::Relaxed)
             || self.waveform.load(Ordering::Relaxed)
     }
 
     /// Analyse tracks so the seek bar can show their waveform.
     pub fn set_waveform(&self, on: bool) {
         self.waveform.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_automix(&self, on: bool) {
+        self.automix.store(on, Ordering::Relaxed);
+    }
+
+    pub fn automix_on(&self) -> bool {
+        self.automix.load(Ordering::Relaxed)
     }
 
     pub fn set_auto_dj(&self, on: bool) {
@@ -757,10 +769,16 @@ impl Player {
         } else {
             0.0
         };
-        let lead = if xf {
-            self.crossfade_secs() as f64 + 0.2 + extra
-        } else {
-            0.35
+        // AutoMix: start where the outgoing track's analysis says (outro,
+        // bar line, music end) with a length to match.
+        let mix = (xf && self.automix.load(Ordering::Relaxed)).then(|| {
+            let id = s.track.as_ref().map(|t| t.id.clone()).unwrap_or_default();
+            crate::automix::mix_point(self.cached(&id).as_ref(), s.duration)
+        });
+        let lead = match mix {
+            Some(m) => (s.duration - m.start_s).max(0.0) + extra,
+            None if xf => self.crossfade_secs() as f64 + 0.2 + extra,
+            None => 0.35,
         };
         // Smart start: the outgoing track has trailed off into silence
         // near its end - move on instead of playing dead air.
@@ -772,7 +790,12 @@ impl Player {
             return None;
         }
         self.blending.store(true, Ordering::Relaxed);
-        let style = if xf {
+        let style = if let Some(m) = mix {
+            // Starting late (seek near the end, analysis arrived late):
+            // fit the blend into what is left.
+            let left = (s.duration - s.position - 0.2).max(1.0) as f32;
+            PlayStyle::Crossfade(m.secs.min(left))
+        } else if xf {
             PlayStyle::Crossfade(self.crossfade_secs())
         } else {
             PlayStyle::Gapless

@@ -274,6 +274,8 @@ export interface Settings {
   bg_video?: boolean;
   /** Darken the video background, percent 0..80. */
   bg_video_dim?: number;
+  /** DJ-style transitions (timing per song, tempo/beat matching, bass swap). */
+  automix?: boolean;
   /** Desktop frosted-glass strength 0..=100 (0 = off). */
   transparency?: number;
   /** Inset chrome panels with gaps and rounded corners. */

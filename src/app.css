@@ -4908,3 +4908,14 @@ html.extreme ::selection { background: var(--accent); color: #000; }
 .np-lyrics[data-font='mono'] .ly { font-family: ui-monospace, 'Cascadia Code', 'JetBrains Mono', 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace; }
 .np-lyrics[data-font='condensed'] .ly { font-family: Bahnschrift, 'Arial Narrow', 'Roboto Condensed', 'Helvetica Neue', 'DejaVu Sans Condensed', sans-serif; font-stretch: 75%; }
 .np-lyrics[data-font='rounded'] .ly { font-family: ui-rounded, 'SF Pro Rounded', Nunito, 'Varela Round', 'Arial Rounded MT Bold', ui-sans-serif, system-ui, sans-serif; }
+
+/* AutoMix button: a slow spin while two songs are being blended. */
+.automix-btn.mixing svg {
+  animation: automix-spin 2.4s linear infinite;
+}
+@keyframes automix-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .automix-btn.mixing svg { animation: none; }
+}
