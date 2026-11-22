@@ -4497,6 +4497,7 @@
         <div class="np-ctrls">
           <div class="np-side">
             <IconBtn
+              class="np-like"
               icon={FavouriteIcon}
               altIcon={FavouriteFilledIcon}
               showAlt={player.liked}
@@ -4506,8 +4507,9 @@
               title={tr('Like')}
               btnSize="lg"
             />
-            <IconBtn icon={ThumbsDownIcon} size={22} on={player.disliked} danger onclick={toggleDislike} title={tr('Dislike')} btnSize="lg" />
+            <IconBtn class="np-dislike" icon={ThumbsDownIcon} size={22} on={player.disliked} danger onclick={toggleDislike} title={tr('Dislike')} btnSize="lg" />
             <IconBtn
+              class="np-radio"
               icon={Radio02Icon}
               size={22}
               disabled={!player.track}
@@ -4515,6 +4517,24 @@
               title={tr('Radio')}
               btnSize="lg"
             />
+            <IconBtn
+              class="np-automix automix-btn {autoMixing ? 'mixing' : ''}"
+              icon={AutoMixIcon}
+              size={22}
+              on={!!settings.automix}
+              onclick={toggleAutoMix}
+              title={autoMixing ? tr('AutoMix: mixing…') : tr('AutoMix')}
+              btnSize="lg"
+            />
+            <span class="np-x np-look"><LyricsLook {settings} onsave={() => api.setSettings(settings)} /></span>
+            <span class="np-x np-sleep">
+              <SleepTimer
+                trackId={player.track?.id ?? null}
+                position={player.position}
+                duration={player.duration}
+                onStop={() => { api.pause().catch(() => {}); toast(tr('Sleep timer: paused'), 'info', 2600); }}
+              />
+            </span>
           </div>
           <div class="np-transport">
             <IconBtn icon={ShuffleIcon} size={22} on={player.shuffle} onclick={toggleShuffle} title={tr('Shuffle')} btnSize="lg" />
@@ -4561,22 +4581,6 @@
               title={tr('Queue')}
               btnSize="lg"
             />
-            <IconBtn
-              class="automix-btn {autoMixing ? 'mixing' : ''}"
-              icon={AutoMixIcon}
-              size={22}
-              on={!!settings.automix}
-              onclick={toggleAutoMix}
-              title={autoMixing ? tr('AutoMix: mixing…') : tr('AutoMix')}
-              btnSize="lg"
-            />
-            <LyricsLook {settings} onsave={() => api.setSettings(settings)} />
-            <SleepTimer
-              trackId={player.track?.id ?? null}
-              position={player.position}
-              duration={player.duration}
-              onStop={() => { api.pause().catch(() => {}); toast(tr('Sleep timer: paused'), 'info', 2600); }}
-            />
             {#if !isPhone}
               <span class="rc-phone np-remote"><RemoteQuick placement="up" bind:this={remoteQuick} /></span>
               <span class="rc-phone np-jam"><JamQuick placement="up" {settings} onsave={() => api.setSettings(settings)} /></span>
@@ -4605,6 +4609,7 @@
             </div>
             {#if !isPhone}
               <IconBtn
+                class="np-mini"
                 icon={MiniPlayerIcon}
                 size={22}
                 btnSize="lg"
