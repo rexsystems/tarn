@@ -4793,6 +4793,7 @@
             </div>
             <div class="likes">
               <IconBtn
+                class="lk-like"
                 icon={FavouriteIcon}
                 altIcon={FavouriteFilledIcon}
                 showAlt={player.liked}
@@ -4845,7 +4846,7 @@
           {#if player.error}<span class="err">{friendlyError(player.error, "Can't play this track")}</span>{/if}
           {#if player.loading && !player.playing}<div class="spin"></div>{/if}
           <IconBtn
-            class="rc-mid automix-btn {autoMixing ? 'mixing' : ''}"
+            class="rc-mid rc-automix automix-btn {autoMixing ? 'mixing' : ''}"
             icon={AutoMixIcon}
             size={22}
             on={!!settings.automix}
@@ -4854,7 +4855,7 @@
             btnSize="lg"
           />
           <IconBtn
-            class="rc-mid"
+            class="rc-mid rc-queue"
             icon={Queue02Icon}
             size={22}
             on={queueOn}
@@ -4862,15 +4863,17 @@
             title={tr('Queue')}
             btnSize="lg"
           />
-          <SleepTimer
-            trackId={player.track?.id ?? null}
-            position={player.position}
-            duration={player.duration}
-            onStop={() => { api.pause().catch(() => {}); toast(tr('Sleep timer: paused'), 'info', 2600); }}
-          />
+          <span class="rc-sleep">
+            <SleepTimer
+              trackId={player.track?.id ?? null}
+              position={player.position}
+              duration={player.duration}
+              onStop={() => { api.pause().catch(() => {}); toast(tr('Sleep timer: paused'), 'info', 2600); }}
+            />
+          </span>
           {#if !isPhone}
-            <span class="rc-phone"><RemoteQuick placement="up" bind:this={remoteQuick} /></span>
-              <span class="rc-phone"><JamQuick placement="up" {settings} onsave={() => api.setSettings(settings)} /></span>
+            <span class="rc-phone rc-remote"><RemoteQuick placement="up" bind:this={remoteQuick} /></span>
+            <span class="rc-phone rc-jam"><JamQuick placement="up" {settings} onsave={() => api.setSettings(settings)} /></span>
           {/if}
           <div class="vol" onwheel={nudgeVolume}>
             <IconBtn

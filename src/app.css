@@ -1425,7 +1425,7 @@ html[data-glass='1'] .sug {
   display: grid;
   /* Sides may shrink to 0 so a narrow window never crushes the transport.
      Equal 1fr columns keep play controls visually centred. */
-  grid-template-columns: minmax(0, 1fr) minmax(200px, 480px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(264px, 400px) minmax(0, 1fr);
   align-items: center;
   flex: 1 1 auto;
   min-height: 0;
@@ -1629,6 +1629,10 @@ html[data-glass='1'] .sug {
   min-width: 0;
   max-width: 100%;
   padding-right: 4px;
+  /* Its own width decides what fits (container queries further down). */
+  container: nowc / inline-size;
+  overflow-x: clip;
+  overflow-clip-margin: 6px;
 }
 .now .cov {
   position: relative;
@@ -1778,6 +1782,20 @@ html[data-glass='1'] .sug {
   justify-content: flex-end;
   gap: 2px;
   flex-wrap: nowrap;
+  min-width: 0;
+  container: rc / inline-size;
+  /* Never draw over the transport, whatever is left. */
+  overflow-x: clip;
+  overflow-clip-margin: 6px;
+}
+.rc-sleep { display: contents; }
+.right-c .err {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* Player chrome icons: circle hover, not the square ibtn chip. */
 .right-c .ibtn {
@@ -1797,7 +1815,9 @@ html[data-glass='1'] .sug {
   align-items: center;
   gap: 8px;
   width: 140px;
-  flex: 0 0 140px;
+  /* Shrinks (down to a short bar) before any button has to go. */
+  flex: 0 1 140px;
+  min-width: 100px;
   position: relative;
   overflow: visible;
   margin-left: 4px;
@@ -1811,25 +1831,26 @@ html[data-glass='1'] .sug {
   flex: 0 0 auto;
 }
 
-/* Player width (not window width) drives what we keep - sidebar doesn't lie. */
-@container player (max-width: 820px) {
-  .now .likes > :nth-child(n + 2) { display: none; }
-  .vol { width: 110px; flex-basis: 110px; }
-}
+/* Each side of the bar measures itself and drops its least important
+   buttons when it runs out of room, so the transport stays centred and
+   nothing is drawn on top of it. Sizes: 44px buttons + 2px gap. */
 @container player (max-width: 680px) {
-  .player-in { padding: 2px 10px 6px; gap: 8px; grid-template-columns: minmax(0, 1fr) minmax(180px, 1.1fr) auto; }
+  .player-in { padding: 2px 10px 6px; gap: 8px; }
   .now .cov, .now .cov img, .now .cov .ph { width: 48px; height: 48px; flex-basis: 48px; }
-  .right-c .rc-mid,
-  .right-c .rc-mini { display: none; }
   .ctrls .row-c { gap: 2px; }
-  .vol { width: 88px; flex-basis: 88px; gap: 6px; }
-  .vol .sbar { min-width: 48px; }
 }
-@container player (max-width: 520px) {
-  .vol { display: none; }
-  .now .likes { display: none; }
-  .player-in { grid-template-columns: minmax(0, 0.9fr) minmax(160px, 1fr) auto; }
-}
+/* right: queue, automix, sleep, remote, jam, mini, volume */
+@container rc (max-width: 379px) { .rc-jam { display: none; } }
+@container rc (max-width: 333px) { .rc-remote { display: none; } }
+@container rc (max-width: 287px) { .rc-mini { display: none; } }
+@container rc (max-width: 241px) { .rc-sleep { display: none; } }
+@container rc (max-width: 195px) { .rc-automix { display: none; } }
+@container rc (max-width: 149px) { .vol { display: none; } }
+/* left: cover, title, like / dislike / save / radio */
+@container nowc (max-width: 330px) { .now .likes > :nth-child(n + 3) { display: none; } }
+@container nowc (max-width: 250px) { .now .likes > :nth-child(n + 2) { display: none; } }
+@container nowc (max-width: 190px) { .now .likes { display: none; } }
+@container nowc (max-width: 100px) { .now .meta { display: none; } }
 
 /* ---------- panels (queue / lyrics / related) ---------- */
 .panel {
