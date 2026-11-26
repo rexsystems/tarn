@@ -443,34 +443,55 @@ async fn restore_session(app: &App) {
     }
     match app.store.load() {
         Ok(Some((header, kind))) => {
-            if auth::session_ready_from_header(&header) {
-                if let Err(e) = app.ytm.set_cookie_header(Some(header)).await {
-                    eprintln!("restore session: {e}");
-                } else {
-                    let account = app
+            if !auth::session_ready_from_header(&header) {
+                crate::diag::log("restore session: stored header not ready; ignoring");
+            } else if let Err(e) = app.ytm.set_cookie_header(Some(header.clone())).await {
+                eprintln!("restore session: {e}");
+            } else {
+                let store_label = match kind {
+                    auth::StoreKind::Keyring => "keyring",
+                    auth::StoreKind::EncryptedFile => "encrypted_file",
+                };
+                // Cold start: account_menu often flakes (network / SAPISIDHASH
+                // race). Retry a few times before deciding.
+                let mut account = None;
+                for attempt in 0..3u32 {
+                    account = app
                         .ytm
                         .account()
                         .await
                         .ok()
                         .flatten()
                         .filter(|a| !crate::innertube::account_name_is_guest(&a.name));
-                    if account.is_none() {
-                        eprintln!("restore session: account menu looks logged out; clearing");
-                        crate::diag::log(
-                            "restore session: guest/Settings account — clearing bad cookies",
-                        );
-                        let _ = app.ytm.set_cookie_header(None).await;
-                        let _ = app.store.clear();
-                    } else {
-                        let mut a = app.auth.lock();
-                        a.signed_in = true;
-                        a.mock = false;
-                        a.account = account;
-                        a.store = Some(match kind {
-                            auth::StoreKind::Keyring => "keyring".into(),
-                            auth::StoreKind::EncryptedFile => "encrypted_file".into(),
-                        });
+                    if account.is_some() {
+                        break;
                     }
+                    if attempt + 1 < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            400 * (attempt as u64 + 1),
+                        ))
+                        .await;
+                    }
+                }
+                if account.is_none() && !auth::session_complete_from_header(&header) {
+                    // Google-only jar → guest "Settings" menu. Safe to drop.
+                    eprintln!("restore session: incomplete cookies; clearing");
+                    crate::diag::log("restore session: incomplete session — clearing");
+                    let _ = app.ytm.set_cookie_header(None).await;
+                    let _ = app.store.clear();
+                } else {
+                    // Keep a complete jar even when account_menu flakes.
+                    // Clearing here logged people out on every relaunch.
+                    if account.is_none() {
+                        crate::diag::log(
+                            "restore session: account verify failed; keeping stored cookies",
+                        );
+                    }
+                    let mut a = app.auth.lock();
+                    a.signed_in = true;
+                    a.mock = false;
+                    a.account = account;
+                    a.store = Some(store_label.into());
                 }
             }
         }
@@ -2799,6 +2820,41 @@ pub fn run() {
                         "auth",
                         serde_json::json!({ "signed_in": true, "restored": true }),
                     );
+                    // Fill account name later if cold-start verify missed it.
+                    if app_restore.auth.lock().account.is_none() {
+                        let app_acc = app_restore.clone();
+                        let handle_acc = handle_restore.clone();
+                        tauri::async_runtime::spawn(async move {
+                            for delay_ms in [1500u64, 4000, 8000] {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                                if !app_acc.auth.lock().signed_in {
+                                    return;
+                                }
+                                if app_acc.auth.lock().account.is_some() {
+                                    return;
+                                }
+                                let Some(account) = app_acc
+                                    .ytm
+                                    .account()
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .filter(|a| {
+                                        !crate::innertube::account_name_is_guest(&a.name)
+                                    })
+                                else {
+                                    continue;
+                                };
+                                app_acc.auth.lock().account = Some(account);
+                                let _ = handle_acc.emit(
+                                    "auth",
+                                    serde_json::json!({ "signed_in": true, "restored": true }),
+                                );
+                                return;
+                            }
+                        });
+                    }
                 }
                 // Jump List / CLI `--play` wins over the previous session.
                 if let Some(id) = cold_play {

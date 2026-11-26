@@ -1134,16 +1134,27 @@ pub fn account_name_is_guest(name: &str) -> bool {
         || n.contains("premium")
         || n.contains("sign in")
         || n.contains("log in")
+        || n.contains("conecteaz") // RO: Conectați-vă / Conectează-te
+        || n.contains("autentific")
         || n.contains("upgrade")
         || n == "guest"
         || n == "settings"
+        || n == "setări"
+        || n == "setari"
         || n == "help"
+        || n == "ajutor"
         || n == "feedback"
         || n == "privacy"
+        || n == "confidențialitate"
+        || n == "confidentialitate"
         || n == "terms"
         || n == "terms of service"
         || n == "switch account"
+        || n == "schimbați contul"
+        || n == "schimbati contul"
         || n == "add account"
+        || n == "adăugați un cont"
+        || n == "adaugati un cont"
         || n == "purchases and memberships"
         || n == "your data in youtube"
 }
