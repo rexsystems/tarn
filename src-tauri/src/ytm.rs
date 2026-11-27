@@ -2054,10 +2054,7 @@ impl Ytm {
             if let Some(bytes) = self.cache.read_complete(video_id) {
                 if looks_like_audio(&bytes) {
                     let body = crate::decode::GrowingBody::from_complete(bytes);
-                    self.bodies
-                        .lock()
-                        .unwrap()
-                        .insert(stream.url.clone(), body.clone());
+                    self.remember_body(&stream.url, body.clone());
                     return Ok(body);
                 }
                 self.cache.forget(video_id);
@@ -2152,6 +2149,41 @@ impl Ytm {
         Some(b)
     }
 
+    /// Keep a few recent song bodies around (current, next, prefetch) and let
+    /// the rest go. Every entry is a whole song in RAM: bodies read back from
+    /// the disk cache and failed downloads used to stay here forever, so a
+    /// long session grew by ~4 MB per song played. Bodies still in use are
+    /// shared (Arc) and stay alive with whoever is playing them.
+    fn remember_body(&self, url: &str, body: std::sync::Arc<crate::decode::GrowingBody>) {
+        const KEEP: usize = 8;
+        let mut g = self.bodies.lock().unwrap();
+        g.insert(url.to_string(), body);
+        if g.len() <= KEEP {
+            return;
+        }
+        // Finished or failed first, then anything only this map holds.
+        let mut drop: Vec<String> = g
+            .iter()
+            .filter(|(k, b)| k.as_str() != url && (b.is_done() || b.error().is_some()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        drop.truncate(g.len() - KEEP);
+        for k in &drop {
+            g.remove(k);
+        }
+        if g.len() > KEEP {
+            let idle: Vec<String> = g
+                .iter()
+                .filter(|(k, b)| k.as_str() != url && std::sync::Arc::strong_count(b) == 1)
+                .map(|(k, _)| k.clone())
+                .take(g.len() - KEEP)
+                .collect();
+            for k in idle {
+                g.remove(&k);
+            }
+        }
+    }
+
     fn spawn_download(
         &self,
         video_id: &str,
@@ -2173,21 +2205,7 @@ impl Ytm {
                 }
             }
         }
-        {
-            let mut g = self.bodies.lock().unwrap();
-            g.insert(stream.url.clone(), body.clone());
-            if g.len() > 10 {
-                let stale: Vec<String> = g
-                    .iter()
-                    .filter(|(_, b)| b.is_done())
-                    .map(|(k, _)| k.clone())
-                    .take(g.len() - 8)
-                    .collect();
-                for k in stale {
-                    g.remove(&k);
-                }
-            }
-        }
+        self.remember_body(&stream.url, body.clone());
         let stream = stream.clone();
         let body2 = body.clone();
         let cache = self.cache.clone();
